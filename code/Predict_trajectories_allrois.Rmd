@@ -1,0 +1,756 @@
+---
+title: "Predict_trajectories"
+author: "Alfie Wearn"
+date: "28/03/2022"
+output: pdf_document
+---
+
+Load packages and functions
+```{r}
+library(progmod)
+library(tidyverse)
+library(splines)
+library(lme4)
+library(moments) # For calculating skewness
+library(RColorBrewer) # For nice plot colours
+library(lmerTest)
+```
+
+Load data
+```{r}
+# Calculated disease times
+# load(file="../data/Trajectory_models_essentials.Rdata")
+load(file="../data/Trajectory_models_essentials_covars.Rdata")
+
+# Names of TA vars
+load(file="../data/TA_names.Rdata")
+
+# Load TA data with PCs 
+load(file="../data/pc_dataset.Rdata")
+
+```
+
+
+Choose which texture variables will be predicted
+```{r}
+# pc_vars <- c('all_x_PC1','all_x_PC2','all_x_PC3','all_x_PC4','all_x_PC5',
+#              'fo_x_PC1','fo_x_PC2',
+#              'glcm_x_PC1','glcm_x_PC2','glcm_x_PC3','glcm_x_PC4',
+#              'glrlm_x_PC1','glrlm_x_PC2','glrlm_x_PC3','glrlm_x_PC4',
+#              'Volume_Avgx')
+
+pc_vars <- c('all_x_PC1','all_x_PC2','all_x_PC3','all_x_PC4','all_x_PC5',
+             # 'fo_x_PC1','fo_x_PC2',
+             # 'glcm_x_PC1','glcm_x_PC2','glcm_x_PC3','glcm_x_PC4',
+             # 'glrlm_x_PC1','glrlm_x_PC2','glrlm_x_PC3','glrlm_x_PC4',
+             'Volume_Avgx')
+
+# roi <- "AntHipp"
+roi_vars_h <- str_replace_all(pc_vars, 'x', 'Hipp')
+# roi_vars_ba35 <- str_replace_all(pc_vars, 'x', 'AntHipp')
+
+# Stitch them together
+# roi_vars <- c(roi_vars_h,roi_vars_ah,roi_vars_ph,roi_vars_ec)
+# roi_vars <- c(roi_vars_h,roi_vars_ah,roi_vars_ph)
+roi_vars <- roi_vars_h
+```
+
+
+
+# Sample size info
+Before imputing the missing disease times
+```{r}
+pc_dataset %>%
+  group_by(RID) %>%
+  filter(M==min(M)) %>%
+  ungroup() %>%
+  group_by(DX_baseline_Ab) %>%
+  summarise(n=n())
+
+pc_dataset %>%
+  group_by(RID) %>%
+  filter(M==min(M)) %>%
+  ungroup() %>%
+  filter(!is.na(all_Hipp_PC1) & (!is.na(CDRSB) | !is.na(MMSE) | !is.na(ADAS13) | !is.na(AB_centiloid))) %>% # Need only rows with all 4 model parameters
+  group_by(DX_baseline) %>%
+  summarise(n=n(),
+            Mage = mean(Age_bl),
+            SDage = sd(Age_bl))
+
+```
+
+Explore distributions of ta variables
+```{r}
+# How many plots to plot? (25, or number available. Whichever is smaller)
+num_plots <- min(25, length(roi_vars))
+
+Tx_density_plot_precorrect <- pc_dataset %>%
+  filter(!is.na(DX_TxBl_Ab)) %>%
+  filter(Month_TxBl==M) %>%
+  pivot_longer(roi_vars[1:num_plots], names_to = "measure", values_to = "value") %>%
+  ggplot(aes(x=value, group = DX_TxBl_Ab)) +
+  facet_wrap(vars(fct_inorder(measure)), scales = "free") +
+  geom_density(aes(fill=DX_TxBl_Ab), alpha = 0.3)
+Tx_density_plot_precorrect
+```
+
+# Transform skewed PCs
+```{r, eval=FALSE}
+  # Select only the highly skewed columns (absolute skew greater than 1)
+  skewness <- pc_dataset %>%
+  filter(Month_TxBl==M) %>%
+  select(all_of(roi_vars)) %>%
+  apply(2, function(x) skewness(x, na.rm=TRUE))
+  names_highskew <- which(abs(skewness) > 1) %>% names
+  highskew_data <- pc_dataset[,names_highskew]
+  lowskew_data <- pc_dataset %>% select(- all_of(names_highskew))
+  
+  # Log Transform Columns
+  # data_plus <- highskew_data %>% sapply(function(x) x-min(x, na.rm=TRUE)+1) %>% as.data.frame 
+  # data_xfm <- data_plus %>% sapply(function(x) log(x)) %>% as.data.frame 
+  data_plus <- highskew_data - min(highskew_data, na.rm=TRUE) + 1 %>% as.data.frame()
+  data_xfm <- log(data_plus) %>% as.data.frame()
+  tmp <- cbind(data_xfm, lowskew_data)
+  xfm_data <- tmp[,roi_vars]
+  
+  pc_dataset[,roi_vars] <- xfm_data
+  
+  Tx_density_plot_xfm <- pc_dataset %>%
+  filter(!is.na(DX_TxBl_Ab)) %>%
+  filter(Month_TxBl==M) %>%
+  pivot_longer(roi_vars[1:num_plots], names_to = "measure", values_to = "value") %>%
+  ggplot(aes(x=value, group = DX_TxBl_Ab)) +
+  facet_wrap(vars(fct_inorder(measure)), scales = "free") +
+  geom_density(aes(fill=DX_TxBl_Ab), alpha = 0.3)
+Tx_density_plot_xfm
+```
+
+
+# Exclude outliers
+The Trajectory plots are quite sensitive to outliers, so the variables either need to be transformed, or outliers excluded. There are relatively few outlying points, which, in many cases, are very extreme, so excluding them is a better option than transforming the entire dataset.
+No need to run this though if the outlier exclusion already occurs in the PCA script. 
+```{r, eval=TRUE}
+remove_outliers <- function(x, na.rm = TRUE, ...) {
+  qnt <- quantile(x, probs=c(.25, .75), na.rm = na.rm, ...)
+  H <- 3 * IQR(x, na.rm = na.rm)
+  y <- x
+  y[x < (qnt[1] - H)] <- NA
+  y[x > (qnt[2] + H)] <- NA
+  y
+}
+
+tmp <- pc_dataset
+tmp[roi_vars] <- 
+  apply(tmp[roi_vars],2,remove_outliers)
+
+pc_dataset <- tmp
+
+tmp %>%
+  filter(!is.na(DX_TxBl_Ab)) %>%
+  filter(Month_TxBl==M) %>%
+  pivot_longer(roi_vars[1:num_plots], names_to = "measure", values_to = "value") %>%
+  ggplot(aes(x=value, group = DX_TxBl_Ab)) +
+  facet_wrap(vars(fct_inorder(measure)), scales = "free") +
+  geom_density(aes(fill=DX_TxBl_Ab), alpha = 0.3)
+```
+
+
+# Calculate Trajectories
+Put the calculated disease times into the main dataset 
+```{r}
+disease_times <- pivot_wider(prog_dat) %>%
+  select(RID, Month_bl, disease_time_AB_centiloid)
+
+progmod_data <-  merge(disease_times, pc_dataset, by = c('RID','Month_bl'), all.y = TRUE)
+```
+
+Calculate missing disease times for those with at least one calculated from the model
+```{r}
+progmod_data <- progmod_data %>%
+  group_by(RID) %>%
+  filter(any(!is.na(disease_time_AB_centiloid))) %>% # Remove people with no disease times calculated
+  mutate(disease_time = disease_time_AB_centiloid[M==min(M)] + Month_bl) %>%
+  relocate(disease_time, .after = disease_time_AB_centiloid) %>%
+  mutate(age_dt0 = Age_bl-(disease_time_AB_centiloid[M==0]/12)) %>% # Calculate age and disease time 0
+  relocate(age_dt0, .after = Age) %>%
+  ungroup()
+```
+
+# Sample size info
+Now that missing disease times have been imputed
+```{r}
+progmod_data %>%
+  group_by(RID) %>%
+  filter(M==min(M)) %>%
+  ungroup() %>%
+  filter(!is.na(disease_time)) %>% 
+  group_by(DX_baseline_Ab) %>%
+  summarise(n=n())
+
+progmod_data %>%
+  group_by(RID) %>%
+  filter(M==min(M)) %>%
+  ungroup() %>%
+  filter((!is.na(all_Hipp_PC1) | !is.na(all_Hipp_PC2) | !is.na(all_Hipp_PC3) | !is.na(all_Hipp_PC4) | !is.na(all_Hipp_PC5)) & (!is.na(CDRSB) | !is.na(MMSE) | !is.na(ADAS13) | !is.na(AB_centiloid))) %>% 
+  filter(!is.na(disease_time_AB_centiloid)) %>%
+  group_by(DX_baseline_Ab) %>%
+  summarise(n=n(),
+            Mage = mean(Age_bl),
+            SDage = sd(Age_bl))
+
+
+progmod_data %>%
+  group_by(RID) %>%
+  filter(M==min(M)) %>%
+  filter(!is.na(DX_baseline_Ab)) %>%
+  ungroup() %>%
+  filter(!is.na(all_Hipp_PC1) & (!is.na(CDRSB) | !is.na(MMSE) | !is.na(ADAS13) | !is.na(AB_centiloid))) %>% # Need only rows with all 4 model parameters
+  group_by(DX_baseline) %>%
+  summarise(n=n(),
+            Mage = mean(Age_bl),
+            SDage = sd(Age_bl))
+
+# Save ID list
+Tx_model_list <- progmod_data %>%
+  filter((!is.na(all_Hipp_PC1) | !is.na(all_Hipp_PC2) | !is.na(all_Hipp_PC3) | !is.na(all_Hipp_PC4) | !is.na(all_Hipp_PC5)) & (!is.na(CDRSB) | !is.na(MMSE) | !is.na(ADAS13) | !is.na(AB_centiloid))) %>% 
+  filter(!is.na(disease_time_AB_centiloid)) %>%
+  filter(!is.na(DX_baseline_Ab)) %>% 
+  select(PTID, VISCODE) %>%
+  mutate(Tx_model = "Y")
+
+save(Tx_model_list, file="../data/ID_lists/Tx_model_list.Rdata")
+```
+
+Create List of column names to be predicted
+```{r}
+vars <- c('MMSE', 'CDRSB', 'ADAS13',
+          'ABETA','AV1451','AV45','AB_centiloid','PTAU',
+          'Hippocampus',
+          all_of(roi_vars))
+```
+
+
+Make long dataset with relevant variables
+```{r}
+cascade_dat <- progmod_data[, c('RID', 
+                                'PRE', 'MCI', 'DEM', 'Age','age_dt0',
+                                'Month_bl',
+                                'disease_time',
+                                all_of(vars))]
+
+# Remove v high AV45 value
+cascade_dat <- cascade_dat %>%
+  filter(RID != 4386) # The one with absurd values for AV45...
+
+# Add in the disease times
+# cascade_dat <- merge(cascade_dat, disease_times, by=c('RID','Month_bl'))
+
+# Extend it longer, with all the variables we want to plot (Even if they were not in the original calculation for disease time)
+cascade_dat <- pivot_longer(cascade_dat, cols = all_of(vars))
+# cascade_dat <- na.omit(cascade_dat) # DOES THIS NEED TO BE COMMENTED OUT?? If this is not commented, each variable will be predicted throughout it's own range. Otherwise, the same disease time range will be used to all variables
+cascade_dat$name <- factor(cascade_dat$name)
+
+# cascade_dat <- cascade_dat %>% rename(disease_time = disease_time_AB_centiloid)
+
+```
+
+
+```{r}
+t_p <- seq(-5, 20, length = 300)
+cascade_plot <- data.frame(disease_time = NA, name = NA, value = NA, value_d_n = NA)
+```
+
+Find variables for which Dementia group is larger than Healthy group. These ones should be 'inverted'
+```{r}
+healthy_means <- progmod_data %>%
+  filter(DX_baseline_Ab=="Healthy") %>%
+  select(all_of(vars)) %>%
+  colMeans(na.rm=TRUE)
+
+dem_means <- progmod_data %>%
+  filter(DX_baseline_Ab=="Dementia") %>%
+  select(all_of(vars)) %>%
+  colMeans(na.rm=TRUE)
+
+invert_vars <- healthy_means[healthy_means < dem_means] %>% names()
+```
+
+## Patient-level sensitivity to change
+```{r}
+for (v in vars) {
+  tmp <- subset(cascade_dat, name == v)
+  t_pp <- seq(quantile(tmp$disease_time, p = 0.05), quantile(tmp$disease_time, p = 0.95), length = 200) # Prediction range, excluding 5% limits of data
+  mods <- list()
+  
+  for (df in 3:6) {
+    B <- ns(cascade_dat$disease_time, df = df) 
+    mods[[df - 2]] <- lmer(value ~ predict(B, newx = disease_time) + (1 | RID), 
+                             data = tmp, REML = FALSE)
+  }
+  
+  df <- which.min(sapply(mods, BIC)) + 2
+  cat(paste(v, nrow(tmp), ':', round(min(t_pp)), round(max(t_pp)), 'df = ', df, '\n'))
+  B <- ns(cascade_dat$disease_time, df = df) 
+  mod <- lmer(value ~ predict(B, newx = disease_time) + (1 | RID), 
+              data = tmp, REML = TRUE)
+  
+  direction <- -1
+  if (v %in% invert_vars)
+    direction <- 1
+  
+  cascade_plot <- rbind(cascade_plot, 
+                        data.frame(
+                          disease_time = t_pp, 
+                          name = v, 
+                          value = predict(mod, 
+                                          re.form = ~ 0,
+                                          newdata = data.frame(disease_time = t_pp)),
+                          value_d_n = direction / summary(mod)$sigma * (predict(mod, 
+                                                                                re.form = ~ 0,
+                                                                                newdata = data.frame(disease_time = t_pp)) -
+                                                                          predict(mod, 
+                                                                                  re.form = ~ 0,
+                                                                                  newdata = data.frame(disease_time = c(t_pp[1] -  diff(t_pp)[1], t_pp[1:(length(t_pp) - 1)])))) / diff(t_pp)[1]))
+}
+cascade_plot <- na.omit(cascade_plot)
+```
+
+
+
+## Mean Scale:
+Normalized values based on [0,1] normalization in the central 90% interval of predicted disease times
+```{r}
+cascade_plot$value_n <- cascade_plot$value
+
+for (v in vars) {
+  idx <- cascade_plot$name == v
+  if (v %in% invert_vars) {
+    cascade_plot$value_n[idx] <- with(cascade_plot[idx, ], (value - min(value)) / diff(range(value)))
+  } else {
+    cascade_plot$value_n[idx] <- 1 - with(cascade_plot[idx, ], (value - min(value)) / diff(range(value)))
+  }
+}
+```
+
+ALTERNATIVE: Normalized values based on [0,1] normalization in the central 90% interval of predicted disease times BUT not min/max value: min/max predicted time! So always starts and ends in the same place. 
+```{r}
+# cascade_plot$value_n3 <- cascade_plot$value
+# 
+# for (v in vars) {
+#   idx <- cascade_plot$name == v
+#   cascade_plot$value_n3[idx] <- with(cascade_plot[idx, ], (value - value[t_pp==min(disease_time)]) / (value[t_pp==max(disease_time)] - value[t_pp==min(disease_time)]))
+# }
+```
+
+
+## Relative abnormality compared to Healthy Group
+```{r}
+cascade_plot$value_n2 <- cascade_plot$value
+
+for (v in vars) {
+  idx <- cascade_plot$name == v
+  if (v %in% invert_vars) {
+    min_n <- quantile(subset(progmod_data, DX_baseline_Ab=='Healthy')[, v], p = 0.5, na.rm = TRUE)
+    max_n <- quantile(subset(progmod_data, DX_baseline_Ab=='Healthy')[, v], p = 0.95, na.rm = TRUE)
+
+    cascade_plot$value_n2[idx] <- with(cascade_plot[idx, ], (value - min_n) / (max_n - min_n))
+  } else {
+    min_n <- quantile(subset(progmod_data, DX_baseline_Ab=='Healthy')[, v], p = 0.05, na.rm = TRUE)
+    max_n <- quantile(subset(progmod_data, DX_baseline_Ab=='Healthy')[, v], p = 0.5, na.rm = TRUE)
+
+    cascade_plot$value_n2[idx] <- with(cascade_plot[idx, ], (value - max_n) / (min_n - max_n))
+  }
+}
+```
+
+
+
+# Plots
+Plot Prep:
+```{r}
+# Only keep those variables which go above 0.5 relative to the Healthy group (kind of an arbitrary threshold but it keeps the shape graph looking sensible)
+roi_vars_relevant <- cascade_plot %>%
+  group_by(name) %>%
+  filter((name%in%c(roi_vars)) & value_n2[disease_time==max(disease_time)]>=0.1) %>%
+  ungroup()
+
+
+roi_vars_subset <- roi_vars_relevant$name %>% unique
+vol_vars <- roi_vars_subset[grep("Volume_", roi_vars_subset)]
+all_TA_vars <- roi_vars_subset[grep("all_", roi_vars_subset)]
+roi_vars_subset <- c(vol_vars,all_TA_vars)
+
+plot_data <- cascade_plot %>%    
+    filter((name%in%c('ABETA','AB_centiloid',
+                      'AV1451','PTAU',
+                      'Hippocampus',
+                      'CDRSB',
+                      all_of(roi_vars_subset))))
+
+# Modify disease time to be the time at which CSF ABETA crosses 95% abnormality relative to CN AB- group
+# roi_vars_relevant$disease_time <- 
+shift0 <- plot_data %>%
+  filter(name == "ABETA" & value_n2 > 0.95)
+shift0 <- min(shift0$disease_time)
+plot_data$disease_time <- plot_data$disease_time - shift0
+
+# Add columns, such that types of TA/ other vars can be plotted by 'color' and PCs are plotted by line type. 
+# Create variable 'groups'...
+vars_fo <- roi_vars_subset[grep("fo_",roi_vars_subset)]
+vars_glcm <- roi_vars_subset[grep("glcm_",roi_vars_subset)]
+vars_glrlm <- roi_vars_subset[grep("glrlm_",roi_vars_subset)]
+vars_all <- roi_vars_subset[grep("all_",roi_vars_subset)]
+
+vars_pc1 <- roi_vars_subset[grep("_PC1",roi_vars_subset)]
+vars_pc2 <- roi_vars_subset[grep("_PC2",roi_vars_subset)]
+vars_pc3 <- roi_vars_subset[grep("_PC3",roi_vars_subset)]
+vars_pc4 <- roi_vars_subset[grep("_PC4",roi_vars_subset)]
+vars_pc5 <- roi_vars_subset[grep("_PC5",roi_vars_subset)]
+
+vars_vol <- roi_vars_subset[grep("Volume",roi_vars_subset)]
+vars_tx <- roi_vars_subset[grep("PC",roi_vars_subset)]
+
+plot_data <- plot_data %>%
+  mutate(var_type = ifelse(name %in% vars_fo, "fo", 
+                           ifelse(name %in% vars_glcm, "glcm",
+                                  ifelse(name %in% vars_glrlm, "glrlm",
+                                         ifelse(name %in% vars_all, "All TA",
+                                         name))))) %>%
+  mutate(pc_type = ifelse(name %in% vars_pc1, "PC1", 
+                           ifelse(name %in% vars_pc2, "PC2",
+                                  ifelse(name %in% vars_pc3, "PC3",
+                                         ifelse(name %in% vars_pc4, "PC4",
+                                                ifelse(name %in% vars_pc5, "PC5",
+                                                       "Non-texture variable")))))) %>%
+  mutate(sub_type = ifelse(name %in% vars_vol, "Volume", 
+                           ifelse(name %in% vars_tx, "Texture",
+                                  name)))
+
+# plot_data$roi_type <- factor(plot_data$roi_type, levels=c('Non-texture variable','Hipp','AntHipp','PostHipp','EC','BA35'))
+
+cols0 <- colorRampPalette(brewer.pal(5, "PiYG"))
+cols1 <- colorRampPalette(brewer.pal(5, "Reds"))
+cols2 <- colorRampPalette(brewer.pal(5, "Greens"))
+cols3 <- colorRampPalette(brewer.pal(5, "Blues"))
+```
+
+Filter which curves should be plotted (optional)
+```{r}
+# Leave out texture variables
+# plot_data <- plot_data[plot_data$name %in% c('ABETA','AB_centiloid', 'AV1451','PTAU', 'Hippocampus', 'CDRSB'),]
+
+# Plot only texture variables
+# plot_data <- plot_data[plot_data$name %in% roi_vars_subset,]
+
+# Plot texture variables, amyloid (and a cognitive score?)
+
+plot_data <- plot_data[plot_data$name %in% c('ABETA','CDRSB','PTAU','CDRSB', roi_vars_subset),]
+
+# Reorder these to that order
+plot_data$name <- factor(plot_data$name, levels=c('ABETA','CDRSB','PTAU', roi_vars_subset))
+
+
+```
+
+Rank variables in order of maximum change (relative to healthy group)
+```{r}
+tmp2 <- cascade_plot %>%
+  group_by(name) %>%
+  summarise(max_value_n2 = max(value_n2))
+
+abnormality_vars <- tmp2[order(tmp2$max_value_n2, decreasing = TRUE),] 
+abnormality_vars
+```
+
+
+Actual plotting
+```{r}
+# Normalized values on mean scale
+plot_data %>%
+  ggplot(aes(x=disease_time, y=value_n, group=name, color=sub_type, linetype=pc_type)) +
+  geom_line(size = 0.5) +
+  # xlim(0,150) +
+
+  # scale_color_manual("",values=c(cols0(1),cols1(2),cols2(1),cols3(4))) +
+  ylab("Biomarker abnormality (mean scale)") +
+  ggtitle("Shape of variable trajectories")
+
+# # Normalized values on mean scale (allowance for U-shaped trajectory)
+# plot_data %>%
+#   ggplot(aes(x=disease_time, y=value_n3, group=name, color=var_type, linetype=pc_type)) +
+#   geom_line(size = 1) +
+#   ylab("Biomarker abnormality (mean scale)") +
+#   ggtitle("Shape of variable trajectories (forced start and end and [0,1])")
+
+# Normalized to Healthy group
+plot_data %>%
+    filter(!(name%in%c('MMSE'))) %>%
+  ggplot(aes(x=disease_time, y=value_n2, group=name, color=sub_type, linetype=pc_type)) +
+  geom_line(size = 0.5) +
+  ylim(-0.15,1.25) +
+    # xlim(0,160) +
+  ylab("Biomarker abnormality (relative to AB- Healthy Group)") +
+  ggtitle("Variable abnormality relative to Healthy (Amyloid-) group")
+
+# Relative Sensitivity
+plot_data %>%
+  ggplot(aes(x=disease_time, y=value_d_n, group=name, color=sub_type, linetype=pc_type)) +
+  geom_line(size = 0.5) +
+  # xlim(0,160) +
+  ylim(-0.01,0.1) +
+  ylab("Relative Sensitivity to Change (patient level)") +
+  ggtitle("Shape of variable trajectories")
+
+
+```
+Make these plots prettier
+```{r}
+plot_data %>%
+    filter(!(name%in%c('MMSE'))) %>%
+  ggplot(aes(x=disease_time, y=value_n2, group=name, color=sub_type)) +
+  geom_line(size = 1.2) +
+  # scale_color_manual("",values = c(cols1(4), cols2(2))) +
+  # scale_color_brewer(palette = "Dark2") +
+# scale_fill_gradientn(colours=coolwarm(100), guide = "colourbar") +
+  theme_bw() +  
+  ylim(-0.15,1.6) +
+  xlim(-24,131) +
+  ylab("Biomarker abnormality (relative to AB- Healthy Group)") +
+  ggtitle("Variable abnormality relative to Healthy (Amyloid-) group")
+
+
+plot_data %>%
+    filter(!(name%in%c('MMSE'))) %>%
+  ggplot(aes(x=disease_time, y=value_d_n, group=name, color=sub_type)) +
+  geom_line(size = 1.2) +
+  # scale_color_manual("",values = c(cols1(4), cols2(2))) +
+  # scale_color_brewer(palette = "Dark2") +
+# scale_fill_gradientn(colours=coolwarm(100), guide = "colourbar") +
+  theme_bw() +  
+  ylim(-0.005, 0.06) +
+  xlim(-24,131) +
+  ylab("Biomarker abnormality (relative to AB- Healthy Group)") +
+  ggtitle("Variable abnormality relative to Healthy (Amyloid-) group")
+```
+
+
+
+
+
+# Explore variables further. 
+
+Relation to age, amyloid status and other covariates
+```{r, eval=TRUE}
+my_line <- function(x,y,...){
+    points(x,y,...)
+    fit <- lm(y ~ x) 
+    abline(a = fit$coefficients[1] , b = fit$coefficients[2],col="red", lwd=3,...)
+}
+
+progmod_data$male <- as.factor(progmod_data$male)
+
+  # Correlation matrix of baseline values
+progmod_data %>%
+    filter(M==0) %>%
+    select(Age, ADAS13, Hippocampus, all_of(roi_vars_subset)) %>%
+    pairs(panel = my_line)
+
+# Select a subset of variables to plot trajectory data
+# vars_subset <- vars[c(1:14, 25, 26:30,41)]
+
+for (var in c(vars)) {
+  # Age by ta_vars
+  age_plot <- progmod_data %>%
+    ggplot(aes_string(x = "Age", y = var)) +
+    geom_line(aes(color=DX_baseline_Ab, group=RID), alpha = 0.5) + 
+    geom_point(aes(color=DX_baseline_Ab, group=RID), alpha = 0.2, size = 0.3) + 
+    geom_smooth(data = subset(progmod_data, Age > quantile(Age, p = 0.05) & Age < quantile(Age, p = 0.95)), colour="darkgreen") +
+    scale_color_brewer(palette = "Dark2") 
+  print(age_plot)
+  
+  dt_plot <- progmod_data %>%
+    ggplot(aes_string(x = "disease_time", y = var)) +
+    geom_line(aes(color=DX_baseline_Ab, group=RID), alpha = 0.5) + 
+    geom_point(aes(color=DX_baseline_Ab, group=RID), alpha = 0.2, size = 0.3) + 
+    geom_line(data = subset(cascade_plot, name == var), 
+              aes(x= disease_time, y = value), color = 'darkgreen', size = 2) +
+    # geom_smooth(data = subset(progmod_data, disease_time> min(t_pp) & disease_time < max(t_pp)), colour="darkgreen") +
+    scale_color_brewer(palette = "Dark2") 
+  print(dt_plot)
+  
+  gender_plot <- progmod_data %>%
+    subset(M==0) %>%
+    ggplot(aes_string(y = var, x= "male")) +
+    geom_point(aes(group = male, colour = DX_baseline_Ab), alpha = 0.5, position='jitter') +
+    geom_boxplot(aes(group = male), width=0.4, outlier.alpha = 0, alpha = 0.5) +
+    scale_color_brewer(palette = "Dark2") 
+  print(gender_plot)
+  
+  group_plot <- progmod_data %>%
+    subset(M==0) %>%
+    ggplot(aes_string(x = "DX_baseline_Ab", y = var)) +
+    geom_point(position = 'jitter') +
+    geom_boxplot(width=0.4,  outlier.alpha = 0, alpha = 0.8)
+  print(group_plot)
+}
+```
+The lower sensitivity to change of the texture variables could be interpreted as as a result of noise - volume is easier to measure accurately, whereas texture is highly susceptible to noise, despite showing some promise in picking up pathologically relevant information. 
+
+
+# Save data for publication figures
+```{r, eval=FALSE}
+save(plot_data, progmod_data, cascade_plot, file = "../Publication figures/data/predict_trajectories.Rdata")
+```
+
+
+
+# Code Graveyard
+## Trajectories age and disease time on the same plot
+```{r, eval=FALSE}
+for (v in vars) {
+  tmp <- subset(cascade_dat, name == v)
+  t_pp <- seq(quantile(tmp$disease_time, p = 0.05), quantile(tmp$disease_time, p = 0.95), length = 200) # Prediction range, excluding 5% limits of data
+  t_pp_age <- seq(quantile(tmp$age_dt0, p = 0.05), quantile(tmp$age_dt0, p = 0.95), length = 200) # Prediction range, excluding 5% limits of data
+  mods <- list()
+  for (df in 3:6) {
+     B <- ns(cascade_dat$disease_time, df = df) 
+     B_age <- ns(cascade_dat$age_dt0, df = df) 
+     mods[[df - 2]] <- lmer(value ~ predict(B, newx = disease_time) + predict(B_age, newx = age_dt0) + (1 | RID), 
+              data = tmp, REML = TRUE)
+  }
+  
+  df <- which.min(sapply(mods, BIC)) + 2
+  cat(paste(v, nrow(tmp), ':', round(min(t_pp)), round(max(t_pp)), 'df = ', df, '\n'))
+  B <- ns(cascade_dat$disease_time, df = df) 
+  B_age <- ns(cascade_dat$age_dt0, df = df) 
+  mod <- lmer(value ~ predict(B, newx = disease_time) + predict(B_age, newx = age_dt0) + (1 | RID), 
+              data = tmp, REML = TRUE)
+  
+  # direction <- -1
+  # if (v %in% invert_vars)
+  #   direction <- 1
+  
+  idx <- cascade_plot$name == v
+  cascade_plot$value_age[idx]  <- predict(mod,
+                                         re.form = ~ 0, 
+                                         newdata = data.frame(disease_time = t_pp,
+                                                              age_dt0 = t_pp_age))
+  
+  # cascade_plot$value_age_n[idx] <- with(cascade_plot[idx,], (value_age - min(value_age)) / diff(range(value_age)))
+  cascade_plot$age_dt0[idx]  <- t_pp_age
+                                                                          
+}
+```
+Normalized values based on [0,1] normalization in the central 90% interval of predicted disease times
+```{r, eval=FALSE}
+cascade_plot$value_age_n <- cascade_plot$value_age
+
+for (v in vars) {
+  idx <- cascade_plot$name == v
+  if (v %in% invert_vars) {
+    cascade_plot$value_age_n[idx] <- with(cascade_plot[idx, ], (value_age - min(value_age)) / diff(range(value_age)))
+  } else {
+    cascade_plot$value_age_n[idx] <- 1 - with(cascade_plot[idx, ], (value_age - min(value_age)) / diff(range(value_age)))
+  }
+}
+```
+
+# Age-corrected relative to Healthy Group
+```{r, eval=FALSE}
+cascade_plot$value_age_n2 <- cascade_plot$value_age
+
+for (v in vars) {
+  idx <- cascade_plot$name == v
+  if (v %in% invert_vars) {
+    min_n <- quantile(subset(progmod_data, DX_baseline_Ab=='Healthy')[, v], p = 0.5, na.rm = TRUE)
+    max_n <- quantile(subset(progmod_data, DX_baseline_Ab=='Healthy')[, v], p = 0.95, na.rm = TRUE)
+
+    cascade_plot$value_age_n2[idx] <- with(cascade_plot[idx, ], (value_age - min_n) / (max_n - min_n))
+  } else {
+    min_n <- quantile(subset(progmod_data, DX_baseline_Ab=='Healthy')[, v], p = 0.05, na.rm = TRUE)
+    max_n <- quantile(subset(progmod_data, DX_baseline_Ab=='Healthy')[, v], p = 0.5, na.rm = TRUE)
+
+    cascade_plot$value_age_n2[idx] <- with(cascade_plot[idx, ], (value_age - max_n) / (min_n - max_n))
+  }
+}
+```
+
+
+Some quick statistical tests
+```{r, eval=FALSE}
+ta.aov <-  aov(all_Hipp_PC4 ~ DX_baseline_Ab + Age_bl + male + PTEDUCAT + SITE, data = subset(progmod_data,M==0))
+summary(ta.aov)
+
+progmod_data %>%
+  subset(M==0) %>%
+  rstatix::emmeans_test(
+    all_Hipp_PC4 ~ DX_baseline_Ab, covariate= c(Age_bl), p.adjust.method = "fdr"
+  )
+```
+
+LMM change over groups at baseline
+```{r, eval=FALSE}
+var_data <- progmod_data %>%
+  filter(Month_TxBl==M) %>%
+  group_by(RID) %>%
+  mutate(Age_TA_bl = min(Age), .after = Age) %>%
+  ungroup() %>%
+  select(RID, M, all_Hipp_PC1, all_Hipp_PC2, all_Hipp_PC3, all_Hipp_PC4, all_Hipp_PC5, Volume_AvgHipp, DX_baseline_Ab, DX_TxBl_Ab, ABETA_status, PTAU_status, PTAU_ABETA_status, Age_TA_bl, male, PTEDUCAT, ICV_bl, SITE)
+
+  var_data$DX_TxBl_Ab <- as.factor(var_data$DX_TxBl_Ab)
+  var_data$SITE <- as.factor(var_data$SITE)
+  var_data$male <- as.factor(var_data$male)
+  var_data$Age_TA_bl <- scale(var_data$Age_TA_bl)
+  var_data$PTEDUCAT <- scale(var_data$PTEDUCAT)
+  var_data$ICV_bl <- scale(var_data$ICV_bl)
+  var_data$all_Hipp_PC4 <- scale(var_data$all_Hipp_PC4)
+  var_data$Volume_AvgHipp <- scale(var_data$Volume_AvgHipp)
+
+
+  # var_data$all_Hipp_PC4 <- remove_outliers(var_data$all_Hipp_PC4)
+  
+  prodromal_data <- var_data[var_data$DX_TxBl_Ab!="Dementia",]
+  prodromal_data <- prodromal_data[prodromal_data$DX_TxBl_Ab!="MCI",]
+
+  
+  mod_pc1 <-  lmer(all_Hipp_PC1 ~ DX_TxBl_Ab + Age_TA_bl + male + PTEDUCAT + ICV_bl + (1 | SITE), data = prodromal_data)
+  summary(mod_pc1)
+  
+  mod_pc2 <-  lmer(all_Hipp_PC2 ~ DX_TxBl_Ab + Age_TA_bl + male + PTEDUCAT + ICV_bl + (1 | SITE), data = prodromal_data)
+  summary(mod_pc2)
+  
+  mod_pc3 <-  lmer(all_Hipp_PC3 ~ DX_TxBl_Ab + Age_TA_bl + male + PTEDUCAT + ICV_bl + (1 | SITE), data = prodromal_data)
+  summary(mod_pc3)
+    
+  mod_pc4 <-  lmer(all_Hipp_PC4 ~ DX_TxBl_Ab + Age_TA_bl + male + PTEDUCAT + ICV_bl + (1 | SITE), data = prodromal_data)
+  summary(mod_pc4)
+  
+  mod_pc5 <-  lmer(all_Hipp_PC5 ~ DX_TxBl_Ab + Age_TA_bl + male + PTEDUCAT + ICV_bl + (1 | SITE), data = prodromal_data)
+  summary(mod_pc5)
+  
+  mod_vol <-  lmer(Volume_AvgHipp ~ DX_TxBl_Ab + Age_TA_bl + male + PTEDUCAT + ICV_bl + (1 | SITE), data = prodromal_data)
+  summary(mod_vol)
+```
+
+
+
+```{r, eval=FALSE}
+vars
+smooth_dat <- subset(progmod_data, disease_time> min(t_pp) & disease_time < max(t_pp))
+
+var = vars[25]
+progmod_data %>%
+    ggplot(aes_string(x = "disease_time", y = var)) +
+    geom_line(aes(color=DX_baseline_Ab, group=RID), alpha = 0.5) + 
+    geom_smooth(data = smooth_dat, aes(group=DX_TxBl_Ab, color=DX_TxBl_Ab), method = 'lm') +
+    scale_color_brewer(palette = "RdYlBu") 
+  
+var = vars[14]
+progmod_data %>%
+    ggplot(aes_string(x = "disease_time", y = var)) +
+    geom_line(aes(color=DX_baseline_Ab, group=RID), alpha = 0.5) + 
+    geom_smooth(data = smooth_dat, aes(group=DX_TxBl_Ab, color=DX_TxBl_Ab), method = 'lm') +
+    scale_color_brewer(palette = "RdYlBu") 
+```
+
+

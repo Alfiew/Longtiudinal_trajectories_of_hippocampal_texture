@@ -1,0 +1,783 @@
+---
+title: "TA_PCAs"
+author: "Alfie Wearn"
+date: "29/03/2022"
+output: html_document
+---
+
+Create PCAs of glcm variables. Plot out main loadings on each PC (1-5) (we are not excluding any outliers here, should we transform the data?)
+
+```{r}
+library(tidyverse)
+library(factoextra) # For scree plot
+library(moments) # For calculating skewness
+library(corrplot)
+
+
+remove_outliers <- function(x, thresh = 1.5, na.rm = TRUE, ...) {
+  qnt <- quantile(x, probs=c(.25, .75), na.rm = na.rm, ...)
+  H <- thresh * IQR(x, na.rm = na.rm)
+  y <- x
+  y[x < (qnt[1] - H)] <- NA
+  y[x > (qnt[2] + H)] <- NA
+  y
+}
+```
+
+
+```{r}
+# Dataset with TA vars
+load(file="../data/prepped_data.Rdata")
+data <- selected_data
+# Names of TA vars
+load(file="../data/TA_names.Rdata")
+
+```
+
+Get sample size info
+```{r}
+data %>%
+  filter(M==Month_TxBl) %>%
+  group_by(DX_TxBl) %>%
+  summarise(n=n(),
+            Mage = mean(Age_bl),
+            SDage = sd(Age_bl))
+
+data %>%
+  filter(M==Month_TxBl) %>%
+  group_by(RID) %>%
+  mutate(Age_TA_bl = min(Age), .after = Age) %>%
+  ungroup() %>%
+  group_by(DX_TxBl_Ab) %>%
+  summarise(n=n(),
+            Mage = mean(Age_TA_bl),
+            SDage = sd(Age_TA_bl))
+
+# Save ID list
+texture_subset_list <- data %>%
+  filter(!is.na(DX_TxBl_Ab)) %>%
+  select(PTID, VISCODE) %>%
+  mutate(texture_subset = "Y")
+
+save(texture_subset_list, file="../data/ID_lists/texture_subset_list.Rdata")
+
+```
+
+
+```{r}
+TA_names_fo <- TA_names[grep("fo_",TA_names)]
+TA_names_glcm <- TA_names[grep("glcm_",TA_names)]
+TA_names_glrlm <- TA_names[grep("glrlm_",TA_names)]
+```
+
+Combine Left and Right Hemispheres
+```{r}
+# Get Left and Right names separately
+TA_names_left <- TA_names[grep("Left",TA_names)]
+TA_names_right <- TA_names[grep("Right",TA_names)] # Note: They are not in the same order of regions - this is an embuggerance
+
+# Get the data
+Left_TA_data <- data %>% select(all_of(TA_names_left))
+Right_TA_data <- data %>% select(all_of(TA_names_right))
+
+# Remove "Left" and "Right' From the names (replace with Avg)
+left_names_neutral <- gsub('Left', 'Avg', TA_names_left)
+right_names_neutral <- gsub('Right', 'Avg', TA_names_right)
+
+# Rename columns to neutral names
+colnames(Left_TA_data) <- left_names_neutral
+colnames(Right_TA_data) <- right_names_neutral
+
+# Reorder one dataset so that the column names line up between them
+order <- match(left_names_neutral,right_names_neutral)
+Left_TA_data_reordered <- Left_TA_data[order(order)]
+
+# Average the two datasets to create Left & Right Average data
+Avg_TA_data <- (Left_TA_data_reordered + Right_TA_data) / 2
+
+# Put these average columns into the main dataset
+averaged_data <- cbind(data, Avg_TA_data)
+```
+
+Get lists for averaged data
+```{r}
+TA_names_avg <- right_names_neutral[-grep('Volume',right_names_neutral)]
+TA_names_avg <- TA_names_avg[-grep('_4',TA_names_avg)]
+TA_names_avg <- TA_names_avg[-grep('_8',TA_names_avg)]
+TA_names_avg <- TA_names_avg[-grep('_16',TA_names_avg)]
+
+TA_names_avg_fo <- TA_names_avg[grep("fo_",TA_names_avg)]
+TA_names_avg_glcm <- TA_names_avg[grep("glcm_",TA_names_avg)]
+TA_names_avg_glcm_32 <- TA_names_avg_glcm[grep("_32",TA_names_avg_glcm)]
+TA_names_avg_glrlm <- TA_names_avg[grep("glrlm_",TA_names_avg)]
+TA_names_avg_glrlm_32 <- TA_names_avg_glrlm[grep("_32",TA_names_avg_glrlm)]
+
+# (Whole) Hipp
+TA_names_Hipp <- TA_names_avg[grep('AvgHipp',TA_names_avg)]
+TA_names_fo_Hipp <- TA_names_avg_fo[grep('AvgHipp',TA_names_avg_fo)]
+TA_names_glcm_Hipp_32 <- TA_names_avg_glcm_32[grep('AvgHipp',TA_names_avg_glcm_32)]
+TA_names_glrlm_Hipp_32 <- TA_names_avg_glrlm_32[grep('AvgHipp',TA_names_avg_glrlm_32)]
+```
+
+Filter out rows missing vital information
+```{r}
+vol_cols <- averaged_data %>% colnames() %>% str_detect("Volume") %>% which()
+first_vol_col <- vol_cols[1]
+
+averaged_data_nafiltered <- averaged_data %>%
+  filter(!is.na(Volume_LeftHipp))
+
+na_per_row <- averaged_data_nafiltered[first_vol_col:length(averaged_data_nafiltered)] %>% apply(1, function(x) sum(is.na(x)))
+plot(na_per_row)
+
+# Exclude rows with ANY missing values. If there are none, then great, just take the dataset as-is
+if (length(which(na_per_row > 0))) {
+  averaged_data_nafiltered <- averaged_data_nafiltered[-which(na_per_row > 0),]
+}
+
+na_per_row <- averaged_data_nafiltered[first_vol_col:length(averaged_data_nafiltered)] %>% apply(1, function(x) sum(is.na(x)))
+plot(na_per_row)
+```
+
+
+# PCA
+Conduct a PCA on Texture data, and Volume data, separately. 
+Save the covariate data separately.
+```{r}
+pca_covars <- averaged_data_nafiltered[1:(first_vol_col+9)]
+```
+
+PCA prep function - works out which variables need transforming in which direction, if that's what we're doing
+```{r}
+list <- TA_names_Hipp
+
+get_skewed_vars <- function(dat, covars, list){
+  
+  pca_data <- dat %>%
+  select(any_of(list))
+
+  # Get baseline healthy data on which to conduct pca
+  pca_data_bl <- pca_data %>%
+  cbind(covars) %>%
+  filter(M==Month_TxBl) %>%
+  filter(DX_TxBl=="CN")
+  
+  covars_bl <- pca_data_bl %>%
+  select(any_of(names(covars)))
+  
+  pca_data_bl <- pca_data_bl %>%
+   select(-any_of(names(covars)))
+  
+
+  # Select only the highly skewed columns (absolute skew greater than 1)
+  skewness <- pca_data_bl %>%
+  select(all_of(list)) %>%
+  apply(2, function(x) skewness(x))
+  names_rightskew <- which(skewness > 1) %>% names # log these
+  names_leftskew <- which(skewness < -1) %>% names # Exponent/square these
+  names_lowskew <- pca_data_bl %>% select(-all_of(names_rightskew), -all_of(names_leftskew)) %>% names
+  
+
+  tmp_r <- replicate(length(names_rightskew), 'R')
+  tmp_l <- replicate(length(names_leftskew), 'L')
+  tmp_low <- replicate(length(names_lowskew), '0')
+  tmp_all <- c(tmp_r, tmp_l, tmp_low)
+  names_all <- c(names_rightskew,names_leftskew,names_lowskew)
+  
+  names(tmp_all) <- names_all
+  skewed_vars <- tmp_all[list] %>% unlist() # Order the variables the same as in the original list
+  
+  return(skewed_vars)
+}
+```
+
+
+Define setup pca function
+```{r}
+setup_pca <- function(dat, covars, list, do_xfm = TRUE, do_skewed_only=FALSE, skewed_vars = NULL, do_exclude_outliers = FALSE) {
+
+  pca_data <- dat %>%
+  select(any_of(list))
+
+  # Plot vars before transformation
+  num_plots <- min(56, length(list))
+  
+  plot_before <- dat %>%
+  filter(!is.na(DX_TxBl)) %>%
+  filter(M==Month_TxBl) %>%
+  filter(DX_TxBl=="CN") %>%
+  pivot_longer(list[1:num_plots], names_to = "measure", values_to = "value") %>%
+  ggplot(aes(x=value, group = DX_TxBl)) +
+  facet_wrap(vars(fct_inorder(measure)), scales = "free") +
+  geom_density(aes(fill=DX_TxBl), alpha = 0.3) +
+    theme_void() +
+  ggtitle("Before any changes")
+  print(plot_before)
+  
+    # Get baseline healthy data on which to conduct pca
+  pca_data_bl <- pca_data %>%
+  cbind(covars) %>%
+  filter(M==Month_TxBl) %>%
+  filter(DX_TxBl=="CN")
+  
+  covars_bl <- pca_data_bl %>%
+  select(any_of(names(covars)))
+  
+  pca_data_bl <- pca_data_bl %>%
+   select(-any_of(names(covars)))
+  
+  
+  if (do_xfm){
+    
+    if (do_skewed_only) {
+    
+    # Require skewed_vars to be calculated elsewhere. This indicates which variables are skewed, and in which direction.
+    rightskew_data <- pca_data_bl[,skewed_vars=='R'] %>% as.data.frame()
+    leftskew_data <- pca_data_bl[,skewed_vars=='L'] %>% as.data.frame()
+    lowskew_data <- pca_data_bl[,skewed_vars=='0'] %>% as.data.frame()
+    
+    # Have to add names, in case there is only 1 skewed variable in any category
+    names(rightskew_data) <- pca_data_bl[skewed_vars=='R'] %>% names
+    names(leftskew_data) <- pca_data_bl[skewed_vars=='L'] %>% names
+    names(lowskew_data) <- pca_data_bl[skewed_vars=='0'] %>% names
+    
+    # Log/Exp Transform Columns
+    if (length(rightskew_data)==0) {
+      data_xfm <- rightskew_data
+    } else {
+      data_plus <- rightskew_data %>% sapply(function(x) x-min(x, na.rm=TRUE)+1) %>% as.data.frame 
+      data_xfm <- data_plus %>% sapply(function(x) log(x)) %>% as.data.frame 
+    }
+    
+      #(Also need to add minimum value so that negative and positive squared values don't get confused)... -5^2 == 5^2 !
+    if (length(leftskew_data)==0) {
+      data_exp <- leftskew_data
+    } else {
+      data_exp_plus <- leftskew_data %>% sapply(function(x) x-min(x, na.rm=TRUE)+1) %>% as.data.frame 
+      data_exp <- data_exp_plus %>% sapply(function(x) x^2) %>% as.data.frame 
+    }
+    
+    tmp <- cbind(data_xfm, data_exp, lowskew_data)
+    pca_data_bl <- tmp[,list]
+    
+    } else {
+    # Log Transform All Columns
+    data_plus <- pca_data_bl %>% sapply(function(x) x-min(x, na.rm=TRUE)+1) %>% as.data.frame 
+    data_xfm <- data_plus %>% sapply(function(x) log(x)) %>% as.data.frame 
+    pca_data_bl <- data_xfm
+    }
+    
+    # Plot vars after transformation
+    DX_TxBl <- covars$DX_TxBl
+    plot_after <- pca_data_bl %>%
+    cbind(covars_bl) %>%
+    filter(!is.na(DX_TxBl)) %>%
+    filter(M==Month_TxBl) %>%
+    filter(DX_TxBl=="CN") %>%
+    pivot_longer(list[1:num_plots], names_to = "measure", values_to = "value") %>%
+    ggplot(aes(x=value, group = DX_TxBl)) +
+    facet_wrap(vars(fct_inorder(measure)), scales = "free") +
+    geom_density(aes(fill=DX_TxBl), alpha = 0.3) +
+    theme_void() +
+    ggtitle("After Transformation")
+    print(plot_after)
+  }
+  
+
+  if (do_exclude_outliers) {
+
+    outliers_excluded <- apply(pca_data_bl,2,function(x) remove_outliers(x, thresh = 3)) %>% as.data.frame()
+    
+    # I should remove columns that frequenctly cause missing data first...?
+    
+    
+    # Remove rows with missing data
+    na_per_row <- outliers_excluded %>% apply(1, function(x) sum(is.na(x)))
+    plot(na_per_row)
+    
+    
+    # Exclude rows with ANY missing values - they will cause the PCA to crash. 
+    if (length(which(na_per_row > 0))) {
+     pca_data_bl <- outliers_excluded[-which(na_per_row > 0),] %>% as.data.frame()
+     covars_bl <- covars_bl[-which(na_per_row > 0),] %>% as.data.frame()
+    }
+    
+  }
+  
+    # Remove columns with a variance of 0 or very very small)
+  variances <- pca_data_bl %>% sapply(function(x) var(x, na.rm = TRUE)) %>% as.numeric()
+  variance_0 <- list[which(variances<=1e-10)]
+  pca_data_bl <- pca_data_bl %>%
+    select(-any_of(variance_0))
+  
+  new_list <- pca_data_bl %>% names()
+  
+  # Plot data that are to be entered into the PCA.
+  plot_after <- pca_data_bl %>%
+  cbind(covars_bl) %>%
+  filter(!is.na(DX_TxBl)) %>%
+  # filter(M==Month_TxBl) %>%
+  pivot_longer(new_list[1:(min(num_plots, length(new_list)))], names_to = "measure", values_to = "value") %>%
+  ggplot(aes(x=value, group = DX_TxBl)) +
+  facet_wrap(vars(fct_inorder(measure)), scales = "free") +
+  geom_density(aes(fill=DX_TxBl), alpha = 0.3) +
+  theme_void() +
+  ggtitle("After Outlier Exclusion")
+  print(plot_after)
+    
+    
+  ## PCA
+  pca <- prcomp(pca_data_bl, center = TRUE, scale. = TRUE)
+  
+  # Explore PCA results
+  print(fviz_eig(pca, main = new_list[1]))
+  print(get_eig(pca))
+  
+  print(fviz_pca_biplot(pca, repel=TRUE))
+  fviz_pca_var(pca)
+
+  # Plot top loadings
+  n_load <- 5
+  
+  loadings <- abs(pca$rotation[,1:6])
+  loadings_pc1 <- sort(loadings[,1], decreasing = TRUE)
+  loadings_pc1_head <- loadings_pc1 %>% head(n_load)
+  loadings_pc1_tail <- loadings_pc1 %>% tail(n_load)
+  loadings_pc1_extreme <- c(loadings_pc1_head, loadings_pc1_tail)
+  par(mai=c(1,4,1,1))
+  print(barplot(loadings_pc1_extreme, horiz=TRUE, las=1))
+  # par(mai=c(2,1,1,1))
+  # print(barplot(loadings_pc1, las=2, cex.axis = 0.1))
+
+  
+  loadings_pc2 <- abs(sort(loadings[,2], decreasing = TRUE))
+  loadings_pc2_head <- loadings_pc2 %>% head(n_load)
+  loadings_pc2_tail <- loadings_pc2 %>% tail(n_load)
+  loadings_pc2_extreme <- c(loadings_pc2_head, loadings_pc2_tail)
+  par(mai=c(1,4,1,1))
+  print(barplot(loadings_pc2_extreme, horiz=TRUE, las=1))
+  
+  loadings_pc3 <- abs(sort(loadings[,3], decreasing = TRUE))
+  loadings_pc3_head <- loadings_pc3 %>% head(n_load)
+  loadings_pc3_tail <- loadings_pc3 %>% tail(n_load)
+  loadings_pc3_extreme <- c(loadings_pc3_head, loadings_pc3_tail)
+  par(mai=c(1,4,1,1))
+  print(barplot(loadings_pc3_extreme, horiz=TRUE, las=1))
+  
+  loadings_pc4 <- abs(sort(loadings[,4], decreasing = TRUE))
+  loadings_pc4_head <- loadings_pc4 %>% head(n_load)
+  loadings_pc4_tail <- loadings_pc4 %>% tail(n_load)
+  loadings_pc4_extreme <- c(loadings_pc4_head, loadings_pc4_tail)
+  par(mai=c(1,4,1,1))
+  print(barplot(loadings_pc4_extreme, horiz=TRUE, las=1))
+  
+  loadings_pc5 <- abs(sort(loadings[,5], decreasing = TRUE))
+  loadings_pc5_head <- loadings_pc5 %>% head(n_load)
+  loadings_pc5_tail <- loadings_pc5 %>% tail(n_load)
+  loadings_pc5_extreme <- c(loadings_pc5_head, loadings_pc5_tail)
+  par(mai=c(1,4,1,1))
+  print(barplot(loadings_pc5_extreme, horiz=TRUE, las=1))
+  
+  loadings_pc6 <- abs(sort(loadings[,6], decreasing = TRUE))
+  loadings_pc6_head <- loadings_pc6 %>% head(n_load)
+  loadings_pc6_tail <- loadings_pc6 %>% tail(n_load)
+  loadings_pc6_extreme <- c(loadings_pc6_head, loadings_pc6_tail)
+  par(mai=c(1,4,1,1))
+  print(barplot(loadings_pc6_extreme, horiz=TRUE, las=1))
+  
+  return(pca)
+
+}
+```
+
+Create function to apply the pca to other rois (choice of pca - TA, fo, glcm, glrlm)
+```{r}
+apply_PCA_to_roi <- function(pca, dat, covars, roi, do_xfm, do_skewed_only=FALSE, skewed_vars = NULL) {
+ 
+  
+  # I will need to remove the column names - I will also need to remove the columns that had 0 variance in the Hipp data!
+  column_names <- pca$center %>% names
+  column_names_new <- column_names %>% str_replace_all("Hipp", roi)
+   
+  # Select the new data
+  pca_data <- dat %>%
+  select(any_of(column_names_new))
+  
+  # But then change the names to match the old data (so the pca prediction can match them)
+  colnames(pca_data) <- column_names
+  
+  # If variables were transformed before, they need to be transformed here too...
+    if (do_xfm){
+      if (do_skewed_only) {
+        # Require skewed_vars to be calculated elsewhere. This indicates which variables are skewed, and in which direction.
+        # Some cols removed for pca due to 0 variance. Need to select only those from skewed_vars list
+        skewed_subset <- skewed_vars[column_names]
+          
+        rightskew_data <- pca_data[,skewed_subset=='R'] %>% as.data.frame()
+        leftskew_data <- pca_data[,skewed_subset=='L'] %>% as.data.frame()
+        lowskew_data <- pca_data[,skewed_subset=='0'] %>% as.data.frame()
+                
+        # Have to add names, in case there is only 1 skewed variable in any category
+        names(rightskew_data) <- pca_data[skewed_subset=='R'] %>% names
+        names(leftskew_data) <- pca_data[skewed_subset=='L'] %>% names
+        names(lowskew_data) <- pca_data[skewed_subset=='0'] %>% names
+        
+        # Log/Exp Transform Columns
+        if (length(rightskew_data)==0) {
+          data_xfm <- rightskew_data
+        } else {
+          data_plus <- rightskew_data %>% sapply(function(x) x-min(x, na.rm=TRUE)+1) %>% as.data.frame 
+          data_xfm <- data_plus %>% sapply(function(x) log(x)) %>% as.data.frame 
+        }
+        
+        if (length(leftskew_data)==0) {
+          data_exp <- leftskew_data
+        } else {
+          data_exp <- leftskew_data %>% sapply(function(x) x^2) %>% as.data.frame 
+        }
+        
+        tmp <- cbind(data_xfm, data_exp, lowskew_data)
+        pca_data <- tmp[,column_names]       
+        
+        
+      } else {
+        data_plus <- pca_data %>% sapply(function(x) x-min(x, na.rm=TRUE)+1) %>% as.data.frame 
+        data_xfm <- data_plus %>% sapply(function(x) log(x)) %>% as.data.frame 
+        pca_data <- data_xfm
+      }
+    }
+  
+  
+  # Apply PCA transformation to entire dataset 
+  pca_all <- predict(pca, pca_data)
+
+  # Save first 5 PCs  
+  pc1_to_6 <- pca_all %>% 
+    as.data.frame() %>%
+    select(PC1:PC6)
+  
+  # Exclude extreme outliers from this set (I do not know if this is correct...)
+  outliers_excluded <- apply(pc1_to_6,2,function(x) remove_outliers(x, thresh=3)) %>% as.data.frame()
+  
+  pc_plot <- outliers_excluded %>%
+    cbind(covars) %>%
+    filter(!is.na(DX_TxBl)) %>%
+    filter(M==Month_TxBl) %>%
+    pivot_longer(1:6, names_to = "measure", values_to = "value") %>%
+    # filter(value < 50, value > -50) %>%
+    ggplot(aes(x=value, group = DX_TxBl)) +
+    facet_wrap(vars(fct_inorder(measure)), scales = "free") +
+    geom_density(aes(fill=DX_TxBl), alpha = 0.3) +
+    ggtitle(roi)
+  
+  print(pc_plot)
+  
+    return(outliers_excluded)
+}
+```
+
+PCA testing
+```{r, eval=FALSE}
+dat <- averaged_data_nafiltered
+covars <- pca_covars
+list <- TA_names_Hipp
+do_xfm <-  TRUE
+do_exclude_outliers <- TRUE
+do_skewed_only <- TRUE
+skewed_vars <- get_skewed_vars(averaged_data_nafiltered, pca_covars, TA_names_Hipp) 
+# skewed_vars <- skewed_vars_fo
+
+TA_pca <- setup_pca(averaged_data_nafiltered, pca_covars, TA_names_Hipp, do_xfm = TRUE, do_skewed_only=TRUE, skewed_vars = skewed_vars, do_exclude_outliers = TRUE)
+TA_pca <- setup_pca(averaged_data_nafiltered, pca_covars, TA_names_Hipp, do_xfm = TRUE, do_skewed_only=TRUE, skewed_vars = skewed_vars, do_exclude_outliers = TRUE)
+
+pca <- TA_pca_all
+dat <- averaged_data_nafiltered
+covars <- pca_covars
+roi <-  "Hipp"
+
+TA_Hipp_all_PCs <- apply_PCA_to_roi(TA_pca_all, averaged_data_nafiltered, pca_covars, roi = "Hipp", do_xfm = do_xfm, do_skewed_only=do_skewed_only, skewed_vars = skewed_vars)
+
+```
+
+
+# Run the PCAs
+Set common arguments
+```{r}
+dat <- averaged_data_nafiltered
+covars <- pca_covars
+do_xfm=FALSE
+do_skewed_only=FALSE
+do_exclude_outliers = TRUE
+```
+
+Get skewed vars for each list:
+```{r}
+skewed_vars <- get_skewed_vars(averaged_data_nafiltered, pca_covars, TA_names_Hipp) 
+skewed_vars_fo <- get_skewed_vars(averaged_data_nafiltered, pca_covars, TA_names_fo_Hipp) 
+skewed_vars_glcm <- get_skewed_vars(averaged_data_nafiltered, pca_covars, TA_names_glcm_Hipp_32) 
+skewed_vars_glrlm <- get_skewed_vars(averaged_data_nafiltered, pca_covars, TA_names_glrlm_Hipp_32) 
+```
+
+
+Setup:
+```{r}
+TA_pca_all <- setup_pca(dat, covars, TA_names_Hipp, do_xfm = do_xfm, do_exclude_outliers = do_exclude_outliers, do_skewed_only = do_skewed_only, skewed_vars = skewed_vars)
+TA_pca_fo <- setup_pca(dat, covars, TA_names_fo_Hipp, do_xfm = do_xfm, do_exclude_outliers = do_exclude_outliers, do_skewed_only = do_skewed_only, skewed_vars = skewed_vars_fo)
+TA_pca_glcm <- setup_pca(dat, covars, TA_names_glcm_Hipp_32, do_xfm = do_xfm, do_exclude_outliers = do_exclude_outliers, do_skewed_only = do_skewed_only, skewed_vars = skewed_vars_glcm)
+TA_pca_glrlm <- setup_pca(dat, covars, TA_names_glrlm_Hipp_32, do_xfm = do_xfm, do_exclude_outliers = do_exclude_outliers, do_skewed_only = do_skewed_only, skewed_vars = skewed_vars_glrlm)
+```
+
+
+
+# Apply to all regions
+All TA measures:
+```{r}
+TA_Hipp_all_PCs <- apply_PCA_to_roi(TA_pca_all, averaged_data_nafiltered, pca_covars, roi = "Hipp", do_xfm = do_xfm, do_skewed_only=do_skewed_only, skewed_vars = skewed_vars)
+```
+FO measures:
+```{r}
+TA_Hipp_fo_PCs <- apply_PCA_to_roi(TA_pca_fo, averaged_data_nafiltered, pca_covars, roi = "Hipp", do_xfm = do_xfm, do_skewed_only=do_skewed_only, skewed_vars = skewed_vars_fo)
+```
+
+GLCM measures:
+```{r}
+TA_Hipp_glcm_PCs <- apply_PCA_to_roi(TA_pca_glcm, averaged_data_nafiltered, pca_covars, roi = "Hipp", do_xfm = do_xfm, do_skewed_only=do_skewed_only, skewed_vars = skewed_vars_glcm)
+```
+
+GLRLM Measures:
+```{r}
+TA_Hipp_glrlm_PCs <- apply_PCA_to_roi(TA_pca_glrlm, averaged_data_nafiltered, pca_covars, roi = "Hipp", do_xfm = do_xfm, do_skewed_only=do_skewed_only, skewed_vars = skewed_vars_glrlm)
+```
+# Merge in the PCs to TA data
+Put the PCs into the main dataset (at least with RID and M) with new, modality-specific, column names
+Careful not to re-run this chunk - it'll keep appending things to the column names!
+```{r}
+colnames(TA_Hipp_all_PCs) <- paste("all_Hipp", colnames(TA_Hipp_all_PCs), sep = '_')
+colnames(TA_Hipp_fo_PCs) <- paste("fo_Hipp", colnames(TA_Hipp_fo_PCs), sep = '_')
+colnames(TA_Hipp_glcm_PCs) <- paste("glcm_Hipp", colnames(TA_Hipp_glcm_PCs), sep = '_')
+colnames(TA_Hipp_glrlm_PCs) <- paste("glrlm_Hipp", colnames(TA_Hipp_glrlm_PCs), sep = '_')
+
+PC_combined <- cbind(TA_Hipp_all_PCs, TA_Hipp_fo_PCs, TA_Hipp_glcm_PCs, TA_Hipp_glrlm_PCs)
+
+rid_m <- averaged_data_nafiltered %>% select(RID, M)
+  
+pc_data <- cbind(rid_m, PC_combined)
+
+pc_dataset <- merge(averaged_data, pc_data, by = c('RID','M'), all.x=TRUE)
+```
+
+
+# Save data
+```{r}
+save(pc_dataset, file="../data/pc_dataset.Rdata")
+save(TA_names_avg, file = '../data/TA_names_avg.Rdata')
+save(TA_pca_all, file = "../Publication figures/data/TA_pca_all.Rdata") # Save to create figure of top loadings
+```
+
+
+# Make the pdf plots pretty
+```{r}
+plotdat <- TA_Hipp_all_PCs %>%
+  cbind(covars) %>%
+  filter(!is.na(DX_TxBl)) %>%
+  filter(M==Month_TxBl) %>%
+  pivot_longer(1:6, names_to = "measure", values_to = "value") %>%
+  select(value, measure, DX_TxBl) %>% 
+  mutate(roi = 'Hippocampus')
+plotdat$measure <- plotdat$measure %>% as.factor()
+levels(plotdat$measure) <-  c('PC1','PC2','PC3','PC4','PC5','PC6')
+
+plotdat %>%
+  ggplot(aes(x=value, group = DX_TxBl)) +
+  geom_density(aes(fill=DX_TxBl), 
+               alpha = 0.3,
+               size=0.5
+               ) +
+  facet_grid(cols = vars(fct_inorder(measure)),
+             rows = vars(roi), 
+             scales = "free",
+             switch = "both"
+             ) +
+  theme_void() +
+  ggtitle("Principal Component distributions") +
+  theme(plot.title = element_text(hjust = 0.5),
+        strip.text.x = element_text(size=12),
+        strip.text.y = element_text(size=12),
+        ) +
+  scale_fill_brewer(palette=2, type = 'qual', name = "Diagnostic Group") 
+```
+# Correlation of PCs with demographic etc. variables
+```{r}
+corrplot_data <- pc_dataset %>%
+  filter(!is.na(DX_TxBl)) %>%
+  filter(M==Month_TxBl) %>%
+  select(Age, PTEDUCAT,
+         MMSE, ADAS13, CDRSB,
+         PTAU, 
+         AB_centiloid,
+         names(TA_Hipp_all_PCs)[1:6]) 
+
+
+M <- cor(corrplot_data,
+         use="complete.obs",
+         method = 'spearman')
+P <- cor.mtest(corrplot_data,
+         use="complete.obs",
+         method = 'spearman')$p
+
+pc_limit <- nrow(M) - 6
+
+M_new <- M[(pc_limit+1):nrow(M), 1:pc_limit]
+P_new <- P[(pc_limit+1):nrow(M), 1:pc_limit]
+
+corrplot(M_new,
+         p.mat = P_new,
+         method = 'ellipse',
+         cl.ratio = 0.4,
+         tl.col = 'black',
+
+)
+```
+
+
+# Explore what components comprise the PCs
+What makes up the components?
+```{r}
+
+  loadings <- (TA_pca_all$rotation[,1:6])
+  rownames(loadings) <- rownames(loadings) %>% str_remove_all("_AvgHipp")
+  rownames(loadings) <- rownames(loadings) %>% str_remove_all("_32")
+  loadings_fo <- loadings[grep("fo_",rownames(loadings)),]
+  loadings_glcm <- loadings[grep("glcm_",rownames(loadings)),]
+  loadings_glcm1 <- loadings_glcm[1:55,]
+  loadings_glcm2 <- loadings_glcm[56:132,]
+  loadings_glcm3 <- loadings_glcm[133:180,]
+  loadings_glcm4 <- loadings_glcm[181:nrow(loadings_glcm),]
+  loadings_glrlm <- loadings[grep("glrlm_",rownames(loadings)),]
+
+ulim <- 0.30
+llim <- -0.30
+
+# FO stats
+cor_fo <- corrplot(t(loadings_fo), 
+           is.corr = FALSE,
+           tl.cex = 1,
+           tl.col = 'black',
+           cl.pos = "b",
+           cl.ratio = 0.4,
+           col.lim = c(llim,ulim))
+cor_fo <- recordPlot()
+  
+  # GLCM stats
+  cor_glcm1 <- corrplot(t(loadings_glcm1), 
+         is.corr = FALSE,
+           tl.cex = 1,
+           tl.col = 'black',
+           cl.pos = "b",
+           cl.ratio = 0.4,
+         col.lim = c(llim,ulim))
+  cor_glcm1 <- recordPlot()
+
+   cor_glcm2 <- corrplot(t(loadings_glcm2), 
+       is.corr = FALSE,
+           tl.cex = 1,
+           tl.col = 'black',
+           cl.pos = "b",
+           cl.ratio = 0.4,
+       col.lim = c(llim,ulim))
+  cor_glcm2 <- recordPlot()
+
+   cor_glcm3 <- corrplot(t(loadings_glcm3), 
+       is.corr = FALSE,
+           tl.cex = 1,
+           tl.col = 'black',
+           cl.pos = "b",
+           cl.ratio = 0.4,
+         col.lim = c(llim,ulim))
+  cor_glcm3 <- recordPlot()
+
+   cor_glcm4 <- corrplot(t(loadings_glcm4), 
+           is.corr = FALSE,
+           tl.cex = 1,
+           tl.col = 'black',
+           cl.pos = "b",
+           cl.ratio = 0.4,
+           col.lim = c(llim,ulim))
+  cor_glcm4 <- recordPlot()
+
+  # GLRLM stats
+   cor_glrlm <- corrplot(t(loadings_glrlm), 
+           is.corr = FALSE,
+           tl.cex = 1,
+           tl.col = 'black',
+           cl.pos = "b",
+           cl.ratio = 0.4,
+           col.lim = c(llim,ulim))
+
+   cor_glrlm <- recordPlot()
+```
+
+Save plots
+```{r}
+w = 1400
+h = 700
+
+png("../figs/loadings_3Dx_fo.png", width = w, height = h)
+cor_fo
+dev.off()
+
+png("../figs/loadings_3Dx_glcm1.png", width = w, height = h)
+cor_glcm1
+dev.off()
+
+png("../figs/loadings_3Dx_glcm2.png", width = w, height = h)
+cor_glcm2
+dev.off()
+
+png("../figs/loadings_3Dx_glcm3.png", width = w, height = h)
+cor_glcm3
+dev.off()
+
+png("../figs/loadings_3Dx_glcm4.png", width = w, height = h)
+cor_glcm4
+dev.off()
+
+png("../figs/loadings_3Dx_glrlm.png", width = w, height = h)
+cor_glrlm
+dev.off()
+```
+
+
+```{r}
+loadings <- abs(TA_pca_all$rotation[,1:6])
+loadings_pc1 <- sort(loadings[,1], decreasing = TRUE)
+loadings_pc2 <- sort(loadings[,2], decreasing = TRUE)
+loadings_pc3 <- sort(loadings[,3], decreasing = TRUE)
+loadings_pc4 <- sort(loadings[,4], decreasing = TRUE)
+loadings_pc5 <- sort(loadings[,5], decreasing = TRUE)
+loadings_pc6 <- sort(loadings[,6], decreasing = TRUE)
+
+names_pc1 <- loadings_pc1 %>% names %>% as.data.frame 
+names_pc2 <- loadings_pc2 %>% names %>% as.data.frame
+names_pc3 <- loadings_pc3 %>% names %>% as.data.frame
+names_pc4 <- loadings_pc4 %>% names %>% as.data.frame
+names_pc5 <- loadings_pc5 %>% names %>% as.data.frame
+names_pc6 <- loadings_pc6 %>% names %>% as.data.frame
+
+names_all <- cbind(names_pc1, names_pc2,names_pc3,names_pc4,names_pc5,names_pc6)
+names_all <- names_all %>% lapply(gsub, pattern='_AvgHipp', replacement='')
+names_all <- names_all %>% lapply(gsub, pattern='_32', replacement='')
+names_all <- names_all %>% as.data.frame
+colnames(names_all)  <- c("PC1","PC2","PC3","PC4","PC5","PC6")
+
+# Save the csv of top names
+write.csv(names_all, file = "../data/PCA_top_loadings.csv", row.names = FALSE)
+
+plot(loadings_pc1)
+plot(loadings_pc2)
+plot(loadings_pc3)
+plot(loadings_pc4)
+plot(loadings_pc5)
+plot(loadings_pc6)
+```
+

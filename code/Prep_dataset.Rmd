@@ -1,0 +1,211 @@
+---
+title: "Prep_dataset"
+author: "Alfie Wearn"
+date: "31/03/2022"
+output: pdf_document
+---
+
+
+Load packages and data
+```{r}
+library(progmod)
+library(tidyverse)
+library(R.utils) # For 'insert' function
+```
+
+
+```{r}
+merged_data <- readRDS("../data/merged_data.Rdata")
+```
+
+# Pivot data wider
+```{r}
+wide_data_pass1 <- merged_data %>% 
+  # filter(DX_bl!="") %>%
+  filter(!is.na(AGE)) %>%
+  pivot_wider(names_from = Region, values_from = c(Volume:glrlm_LRLGLE)) 
+
+wide_pass1_names <- wide_data_pass1 %>% names()
+glcm_cols <- str_detect(wide_pass1_names, "glcm_") %>% which() 
+vol_indices1 <- str_detect(wide_pass1_names, "Volume_") %>% which()
+
+# Take only one bin's data for Volume and fo data
+wide_data_pass1_1bin <- wide_data_pass1[,1:(glcm_cols[1]-1)] %>% filter(bins==32 | is.na(bins)) %>% select(-bins)
+
+
+wide_data <- wide_data_pass1 %>%
+    pivot_wider(id_cols = c(RID, M), names_from = bins, values_from = c(glcm_cols[1]:length(wide_data_pass1))) %>%  select(-RID, -M)
+
+# Merge back in the rest of the data
+wide_data <- wide_data_pass1_1bin %>%
+  cbind(wide_data)
+
+
+wide_names <- wide_data %>% names()
+
+# Remove all 'NA' columns, e.g. 'Volume_NA', which come from empty regions pivoted wider. (If there are any)
+NA_indices <- str_detect(wide_names, "_NA") %>% which()
+if (!is_empty(NA_indices)){
+  wide_data <- wide_data[,-NA_indices]
+}
+wide_names <- wide_data %>% names()
+
+# Get list of volume names
+vol_indices <- str_detect(wide_names, "Volume_") %>% which()
+vol_names <- colnames(wide_data[vol_indices])
+
+# Get list of all TA names
+TA_names <- wide_names[vol_indices[1]:length(wide_names)]
+```
+
+# How many subjects in total dataset?
+```{r}
+# Everyone
+wide_data %>%
+  filter(M==0) %>%
+  group_by(DX) %>%
+  summarise(n=n(),
+            Mage = mean(AGE),
+            SDage = sd(AGE), 
+            Medu = mean(PTEDUCAT),
+            SDedu = sd(PTEDUCAT))
+
+wide_data %>%
+  filter(M==0) %>%
+  group_by(DX, PTGENDER) %>%
+  summarise(n = n()) %>%
+  mutate(pct = n / sum(n)*100)
+
+# Export lists of IDs and grouping factors
+total_ADNI_list <- wide_data %>%
+  filter(!is.na(DX)) %>%
+  select(PTID, VISCODE) %>%
+  mutate(total_ADNI = "Y")
+
+save(total_ADNI_list, file="../data/ID_lists/total_ADNI_list.Rdata")
+```
+
+
+
+# Create important columns (PRE, MCI, DEM, Amyloid status, things like that)
+Separated into chunks to make it easier to read.
+```{r}
+# Calculate centiloids
+mutated_data1 <- wide_data %>%
+  mutate(male = ifelse(PTGENDER == 'Male', 1, 0)) %>%
+  mutate(AV45c = (159.08 * AV45) - 151.65) %>%  # Centiloid calculations
+  mutate(FBBc = (196.9 * FBB) - 196.03) %>%
+  mutate(AB_centiloid = rowMeans(cbind(AV45c, FBBc), na.rm = TRUE)) %>%
+  relocate(AV45c, FBBc, AB_centiloid, .after = FBB) 
+
+mutated_data1$AB_centiloid[mutated_data1$AB_centiloid=="NaN"] <- NA
+
+# Calculate Biomarker Status
+mutated_data2 <- mutated_data1 %>%
+  group_by(RID) %>%
+  mutate(PTAU_ABETA_status = as.factor(ifelse(!is.na(ABETA) & !is.na(PTAU) & PTAU/ABETA > 0.02205, 1,
+                                              ifelse(!is.na(ABETA) & !is.na(PTAU) & PTAU/ABETA < 0.01995, 0, NA)))) %>%
+  mutate(ABETA_status = as.factor(ifelse(!is.na(ABETA) & ABETA < 931, 1,
+                                         ifelse(!is.na(ABETA) & ABETA > 1029, 0,
+                                                ifelse(!is.na(AB_centiloid) & AB_centiloid > 21, 1,
+                                                       ifelse(!is.na(AB_centiloid) & AB_centiloid < 19, 0, NA)))))) %>%
+  mutate(PTAU_status = as.factor(ifelse(!is.na(PTAU) & PTAU > 22.89, 1,
+                                        ifelse(!is.na(PTAU) & PTAU < 20.71, 0, NA)))) %>%
+  mutate(PTAU_ABETA_status_bl = as.factor(PTAU_ABETA_status[M==min(M)])) %>%
+  mutate(ABETA_status_bl = as.factor(ABETA_status[M==min(M)])) %>%
+  mutate(PTAU_status_bl = as.factor(PTAU_status[M==min(M)])) %>%
+  ungroup()
+
+# Calculate Diagnostic status at baseline
+mutated_data3 <- mutated_data2 %>%
+  group_by(RID) %>%
+  mutate(DX_baseline = as.factor(DX[M==min(M)])) %>%
+  mutate(DX_baseline_Ab = as.factor(ifelse(DX_baseline=="CN", 
+                                      ifelse(ABETA_status_bl==0, "Healthy",
+                                         ifelse(ABETA_status_bl==1, "Preclinical", NA)),
+                                    ifelse(DX_baseline=="MCI" & ABETA_status_bl == 1, "MCI",
+                                      ifelse(DX_baseline=="Dementia" & ABETA_status_bl == 1, "Dementia", NA))))) %>%
+  mutate(DEM = ifelse(DX_baseline_Ab == 'Dementia', 1, 0)) %>%
+  mutate(MCI = ifelse(DX_baseline_Ab == 'MCI', 1, 0)) %>%
+  mutate(PRE = ifelse(DX_baseline_Ab == 'Preclinical', 1, 0)) %>%
+  mutate(HC = ifelse(DX_baseline_Ab == 'Healthy', 1, 0)) %>%
+  ungroup()
+
+# Calculate Diagnostic status at "texture baseline (TxBl)" - defined as the first timepoint to have both texture data and amyloid status (why the latter??).
+mutated_data4 <- mutated_data3 %>%
+  group_by(RID) %>%
+  mutate(TA_present = ifelse(is.na(Volume_RightAntHipp), 0, 1)) %>%
+  mutate(ABETA_present = ifelse(is.na(ABETA_status), 0, 1)) %>%
+  mutate(Month_Tx = ifelse(TA_present == 1 & ABETA_present == 1, M, NA), .after = M) %>% # Why does this filter by the presence of amyloid status??
+  mutate(Month_TxBl = ifelse(all(is.na(Month_Tx)), NA, min(Month_Tx, na.rm=TRUE)), .after = Month_Tx) %>%
+  mutate(PTAU_ABETA_status_TxBl = as.factor(PTAU_ABETA_status[M==Month_TxBl])) %>%
+  mutate(ABETA_status_TxBl = as.factor(ABETA_status[M==Month_TxBl])) %>%
+  mutate(PTAU_status_TxBl = as.factor(PTAU_status[M==Month_TxBl])) %>%
+  mutate(DX_TxBl = ifelse(all(is.na(Month_Tx)), NA, as.character(DX[M==Month_TxBl]))) %>%
+  mutate(DX_TxBl_Ab = as.factor(ifelse(DX_TxBl=="CN", 
+                                    ifelse(ABETA_status_TxBl==0, "Healthy",
+                                       ifelse(ABETA_status_TxBl==1, "Preclinical", NA)),
+                                  ifelse(DX_TxBl=="MCI" & ABETA_status_TxBl == 1, "MCI",
+                                    ifelse(DX_TxBl=="Dementia" & ABETA_status_TxBl == 1, "Dementia", NA))))) %>%
+  ungroup()
+  
+x <- mutated_data4 %>% select(RID, VISCODE, M, DX, DX_baseline, DX_baseline_Ab, DX_TxBl, DX_TxBl_Ab, Month, Month_Tx, Month_TxBl, ABETA_status, ABETA_status_bl, Volume_LeftAntHipp)
+
+# Final changes, and a little filtering. Includes important filtering of Amyloid negative MCI & Dementia.
+mutated_data5 <- mutated_data4 %>%
+  mutate(Age = AGE+Years_bl) %>%
+  rename(Age_bl = AGE)
+
+```
+
+Select interesting and important rows only
+```{r}
+selected_data <- mutated_data5 %>%
+  filter(!is.na(DX_baseline)) %>%  
+  select(RID, PTID, VISCODE, M, Month, Month_bl, Month_TxBl,
+         DX, DX_baseline, DX_baseline_Ab, DX_TxBl, DX_TxBl_Ab, PRE, MCI, DEM,
+         SITE,
+         Age_bl, Age, male, PTEDUCAT, 
+         APOE4, MMSE, MMSE_bl, ADAS13, 
+         CDRSB, CDRSB_bl, FAQ, FAQ_bl, FDG, Hippocampus, Hippocampus_bl, 
+         TAU, PTAU, AV1451, ABETA, AV45, FBB, AV45c, FBBc, AB_centiloid, PTAU_ABETA_status,ABETA_status,PTAU_status,PTAU_bl, 
+         ICV_bl, any_of(TA_names))
+
+# Reorder factors
+selected_data$DX_baseline_Ab <- factor(selected_data$DX_baseline_Ab, levels = c("Healthy","Preclinical","MCI","Dementia"))
+selected_data$DX_TxBl_Ab <- factor(selected_data$DX_TxBl_Ab, levels = c("Healthy","Preclinical","MCI","Dementia"))
+selected_data$DX_TxBl <- factor(selected_data$DX_TxBl, levels = c("CN","MCI","Dementia"))
+```
+
+
+# Sample size calculations
+```{r}
+# Everyone
+selected_data %>%
+  filter(M==0) %>%
+  group_by(DX_baseline) %>%
+  summarise(n=n(),
+            Mage = mean(Age_bl),
+            SDage = sd(Age_bl))
+
+# Those with texture data
+selected_data %>%
+  filter(M==Month_TxBl) %>%
+  filter(!is.na(Volume_LeftHipp)) %>%
+  group_by(DX_TxBl) %>%
+  summarise(n=n(),
+            Mage = mean(Age_bl),
+            SDage = sd(Age_bl))
+```
+
+
+Save dataset and list of TA variables (including volumes)
+```{r}
+save(selected_data, file="../data/prepped_data.Rdata")
+save(TA_names, file = "../data/TA_names.Rdata")
+```
+
+
+
+
+

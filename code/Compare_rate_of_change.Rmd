@@ -1,0 +1,577 @@
+---
+title: "Compare_TA_biomarker_status"
+author: "Alfie Wearn"
+date: "31/03/2022"
+output: pdf_document
+
+Running this at Nathan's request. Change in texture is very noisy so doesn't reveal anything of interest. Volume is more consistent/ less noisy over time. The existing longitudinal analysis shows this. 
+---
+Packages:
+```{r}
+library(tidyverse)
+library(gghalves)
+library(ggprism) # For adding p-value
+library(ggthemes)
+library(ggnewscale) # For multiple colour scales on one plot!
+library(relayer) # Alternative to above ggnewscale
+library(RColorBrewer) # For nice plot colours
+library(FDRestimation) # For calculating FDR Threshold
+library(car) # For Anova function
+library(lme4)
+library(lmerTest)
+library(effectsize) # For calculating eta-squared
+
+remove_outliers <- function(x, na.rm = TRUE, ...) {
+  qnt <- quantile(x, probs=c(.25, .75), na.rm = na.rm, ...)
+  H <- 1.5 * IQR(x, na.rm = na.rm)
+  y <- x
+  y[x < (qnt[1] - H)] <- NA
+  y[x > (qnt[2] + H)] <- NA
+  y
+}
+
+# make color scale shortcut (needed for 'relayer')
+scale_distiller <- function(aesthetics, palette, name, ...) {
+  scale_fill_distiller(
+    aesthetics = aesthetics,
+    palette = palette,
+    name = name,
+    na.value = 'grey95',
+    # guide = guide_colorbar(available_aes = c("colour","colour1", "colour2", "colour3")),
+    ...
+    )
+}
+
+p_thresh <-  0.05
+```
+
+# Load TA data with PCs
+```{r}
+load(file="../data/pc_dataset.Rdata")
+
+pc_vars_template <- c('all_x_PC1','all_x_PC2','all_x_PC3','all_x_PC4','all_x_PC5')
+
+roi <- "Hipp"
+pc_vars <- str_replace_all(pc_vars_template, 'x', roi)     
+```
+
+# Filter data
+```{r, eval=FALSE}
+pc_dataset$ABETA_status <- factor(pc_dataset$ABETA_status, levels = c(0, 1))
+
+fu_dataset <- pc_dataset %>%
+  filter(!is.na(DX_TxBl_Ab)) %>%
+  group_by(RID) %>%
+  mutate(ABETA_status_TxBl = as.factor(ABETA_status[M==Month_TxBl])) %>% # Calculate baseline Abeta status
+  mutate(Age_TA_bl = min(Age), .after = Age) %>% # Calculate baseline age
+  filter(Month_TxBl==M | Month_TxBl+24==M) %>% # Only keep baseline and 24M follow-up
+  filter(n()>1) %>%
+  ungroup() %>%
+  filter(!is.na(ABETA_status_TxBl)) # Only keep if they have an ABETA status. 
+  
+fu_dataset$ABETA_status_TxBl <- as.factor(fu_dataset$ABETA_status_TxBl)
+```
+
+```{r}
+pc_dataset$ABETA_status <- factor(pc_dataset$ABETA_status, levels = c(0, 1))
+
+fu_dataset <- pc_dataset %>%
+  filter(!is.na(DX_TxBl_Ab)) %>%
+  select(RID, M, Month_TxBl, Month, DX_TxBl,DX_TxBl_Ab,
+         Age, PTEDUCAT, male, ICV_bl, SITE,
+         ABETA_status,
+         all_of(pc_vars),
+         Volume_AvgHipp) %>%
+  group_by(RID) %>%
+  mutate(Age_TA_bl = Age[Month_TxBl==M], .after = Age) %>% # Calculate baseline age
+  mutate(ABETA_status_TxBl = as.factor(ABETA_status[M==Month_TxBl])) %>% # Calculate baseline Abeta status
+  mutate(Volume_AvgHipp_bl = Volume_AvgHipp[Month_TxBl==M]) %>%
+  mutate(all_Hipp_PC1_bl = all_Hipp_PC1[Month_TxBl==M]) %>%
+  mutate(all_Hipp_PC2_bl = all_Hipp_PC2[Month_TxBl==M]) %>%
+  mutate(all_Hipp_PC3_bl = all_Hipp_PC3[Month_TxBl==M]) %>%
+  mutate(all_Hipp_PC4_bl = all_Hipp_PC4[Month_TxBl==M]) %>%
+  mutate(all_Hipp_PC5_bl = all_Hipp_PC5[Month_TxBl==M]) %>%
+  ungroup() %>%
+  filter(M==Month_TxBl+24) %>%
+  mutate(all_Hipp_PC1_diff = all_Hipp_PC1-all_Hipp_PC1_bl) %>%
+  mutate(all_Hipp_PC2_diff = all_Hipp_PC2-all_Hipp_PC2_bl) %>%
+  mutate(all_Hipp_PC3_diff = all_Hipp_PC3-all_Hipp_PC3_bl) %>%
+  mutate(all_Hipp_PC4_diff = all_Hipp_PC4-all_Hipp_PC4_bl) %>%
+  mutate(all_Hipp_PC5_diff = all_Hipp_PC5-all_Hipp_PC5_bl) %>%
+  mutate(Volume_AvgHipp_diff = Volume_AvgHipp-Volume_AvgHipp_bl)
+
+fu_dataset$ABETA_status_TxBl <- as.factor(fu_dataset$ABETA_status_TxBl)
+
+# create 'diff' character vector
+pc_vars_diff <- sapply(pc_vars, paste0, "_diff") %>% unname()
+```
+
+
+
+Sample size:
+```{r}
+fu_dataset %>%
+  group_by(DX_TxBl_Ab) %>%
+  summarise(n=n(),
+            Mage = mean(Age_TA_bl),
+            SDage = sd(Age_TA_bl))
+
+fu_dataset %>%
+  group_by(DX_TxBl_Ab, ABETA_status) %>%
+  summarise(n=n())
+
+```
+
+# Do stats and plot data
+
+Answer two questions separately. 
+1) Can change in Tx identify Amyloid positivity? (In CN people)
+```{r}
+var <- pc_vars_diff[4]
+out_list <- list()
+loop_count <- 1
+
+compare_bmks <- function(var, out_list = NULL, loop_count = NULL) {
+  
+  print("Var name:")
+  print(var)
+  
+  var_data <- fu_dataset %>%
+    select(RID, M, all_of(var), DX_TxBl_Ab, Age_TA_bl, male, PTEDUCAT, ICV_bl, SITE)
+  var_filt <- var_data %>% select(all_of(var))
+  colnames(var_filt) <- 'var_filt'
+  var_data <- cbind(var_data, var_filt)
+
+  colnames(var_data)[3] <- 'var'
+    
+  var_data$SITE <- as.factor(var_data$SITE)
+  var_data$male <- as.factor(var_data$male)
+  var_data$Age_TA_bl <- scale(var_data$Age_TA_bl)
+  var_data$PTEDUCAT <- scale(var_data$PTEDUCAT)
+  var_data$ICV_bl <- scale(var_data$ICV_bl)
+  var_data$var_filt <- scale(var_data$var_filt)
+
+
+  var_data$var_filt <- remove_outliers(var_data$var_filt)
+  
+  Dx4.aov <-  lmer(var_filt ~ DX_TxBl_Ab + Age_TA_bl + male + PTEDUCAT + ICV_bl + (1 | SITE), data = var_data)
+  print("Stats across all groups:")
+  print(anova(Dx4.aov))
+
+  cn_data <-  var_data[var_data$DX_TxBl_Ab%in%c("Healthy","Preclinical"),]
+  cn.aov <-  lmer(var_filt ~ DX_TxBl_Ab + Age_TA_bl + male + PTEDUCAT + ICV_bl + (1 | SITE), data = cn_data)
+  print("Healthy vs preclinical:")
+  print(anova(cn.aov))
+
+  mci_data <-  var_data[var_data$DX_TxBl_Ab%in%c("Healthy","MCI"),]
+  mci.aov <-  lmer(var_filt ~ DX_TxBl_Ab + Age_TA_bl + male + PTEDUCAT + ICV_bl + (1 | SITE), data = mci_data)
+  print("Healthy vs MCI:")
+  print(anova(mci.aov))
+  
+  dem_data <-  var_data[var_data$DX_TxBl_Ab%in%c("Healthy","Dementia"),]
+  dem.aov <-  lmer(var_filt ~ DX_TxBl_Ab + Age_TA_bl + male + PTEDUCAT + ICV_bl + (1 | SITE), data = dem_data)
+  print("Healthy vs Dementia:")
+  print(anova(dem.aov))
+
+  # Other posthoc tests
+  pm_data <-  var_data[var_data$DX_TxBl_Ab%in%c("Preclinical","MCI"),]
+  pm.aov <-  lmer(var_filt ~ DX_TxBl_Ab + Age_TA_bl + male + PTEDUCAT + ICV_bl + (1 | SITE), data = pm_data)
+  print("Preclinical vs MCI:")
+  print(anova(pm.aov))
+  
+  md_data <-  var_data[var_data$DX_TxBl_Ab%in%c("MCI","Dementia"),]
+  md.aov <-  lmer(var_filt ~ DX_TxBl_Ab + Age_TA_bl + male + PTEDUCAT + ICV_bl + (1 | SITE), data = md_data)
+  print("MCI vs Dementia:")
+  print(anova(md.aov))  
+    
+  pd_data <-  var_data[var_data$DX_TxBl_Ab%in%c("Preclinical","Dementia"),]
+  pd.aov <-  lmer(var_filt ~ DX_TxBl_Ab + Age_TA_bl + male + PTEDUCAT + ICV_bl + (1 | SITE), data = pd_data)
+  print("Preclinical vs Dementia:")
+  print(anova(pd.aov))  
+  
+
+    plot <- var_data %>%
+    ggplot(mapping = aes(x = DX_TxBl_Ab,
+                         y = var_filt)) +
+    geom_half_violin(alpha = 0.4, width=0.8, position=position_dodge(0.8)) +
+    geom_half_dotplot(binaxis = "y", 
+                      # binwidth = bw, 
+                      dotsize = 0.5,
+                      stackdir="up", width=0.8) +
+    geom_half_boxplot(width = 0.2, position = position_dodge(width=0.8), notch=FALSE, side = "l", outlier.alpha=0) +
+    facet_grid(~DX_TxBl_Ab, space = "free_x", scales='free') +
+    theme_classic() +
+    theme(strip.background =element_rect(fill="lightgray")) +
+    theme(strip.text = element_text(size=15)) +
+    theme(panel.spacing = unit(0.1, "lines")) +
+    theme(legend.position="none") +
+    theme(axis.text = element_text(size = 15), 
+          axis.title = element_text(size = 15), 
+          axis.title.x = element_text(margin = margin(t = 10, r=0, b = 0, l = 0))) +
+    theme(plot.caption = element_text(hjust=0, size = 10)) +
+    labs(title="", 
+         caption="Caption", 
+         x="Abeta Status", 
+         y="Texture Features") +
+    scale_x_discrete(labels=c("1" = "Abeta+","0" = "Abeta-")) +
+    ggtitle(var)
+  
+    print(plot)
+    
+    if (is.null(out_list)){
+      output <- list()
+      output[[1]] <- anova(Dx4.aov)
+      output[[2]] <- anova(cn.aov)
+      output[[3]] <- anova(mci.aov)
+      output[[4]] <- anova(dem.aov)
+      output[[5]] <- anova(pm.aov)
+      output[[6]] <- anova(md.aov)
+      output[[7]] <- anova(pd.aov)
+      names(output)[1:7] <- c(paste(var,'Dx4', sep='_'),paste(var,'cn', sep='_'),paste(var,'mci', sep='_'),paste(var,'dem', sep='_'),paste(var,'pm', sep='_'),paste(var,'md', sep='_'),paste(var,'pd', sep='_'))
+
+    } else {
+      output <- out_list
+      output[[(7*loop_count)-6]] <- anova(Dx4.aov)
+      output[[(7*loop_count)-5]] <- anova(cn.aov)
+      output[[(7*loop_count)-4]] <- anova(mci.aov)
+      output[[(7*loop_count)-3]] <- anova(dem.aov)
+      output[[(7*loop_count)-2]] <- anova(pm.aov)
+      output[[(7*loop_count)-1]] <- anova(md.aov)
+      output[[7*loop_count]] <- anova(pd.aov)
+      names(output)[((7*loop_count)-6):(7*loop_count)] <- c(paste(var,'Dx4', sep='_'),paste(var,'cn', sep='_'),paste(var,'mci', sep='_'),paste(var,'dem', sep='_'),paste(var,'pm', sep='_'),paste(var,'md', sep='_'),paste(var,'pd', sep='_'))
+
+
+    }
+    return(output)
+        
+}
+```
+
+
+
+```{r}
+loop_count <- 1
+anovas_hipp <- list() #create empty list to contain all data
+for (v in pc_vars_diff) {
+  
+  anovas_hipp <- compare_bmks(v, anovas_hipp, loop_count)
+  loop_count <- loop_count + 1
+  
+}
+anovas_hipp_vol <- compare_bmks('Volume_AvgHipp')
+anovas_hipp <- c(anovas_hipp, anovas_hipp_vol)
+
+```
+
+# Plotting all results
+Summarise anova results
+Use geom_count to create a table
+```{r}
+aov <- anovas_hipp
+roi <- "Hipp"
+dx <- "pd"
+
+prep_summary <- function(aov, roi, dx) {
+  
+  aov_dx <- aov[grep(dx,names(aov))]
+  aov_dx_allTA <- aov_dx[grep("all_",names(aov_dx))]
+  aov_dx_vol <- aov_dx[grep("Volume",names(aov_dx))]
+  aov_dx <- c(aov_dx_allTA, aov_dx_vol)
+  
+  F_values <- rbind(aov_dx[1][[1]]$`F value`,
+             aov_dx[2][[1]]$`F value`,
+             aov_dx[3][[1]]$`F value`,
+             aov_dx[4][[1]]$`F value`,
+             aov_dx[5][[1]]$`F value`,
+             aov_dx[6][[1]]$`F value`) %>% as.data.frame()
+  
+  P_values <- rbind(aov_dx[1][[1]]$`Pr(>F)`,
+             aov_dx[2][[1]]$`Pr(>F)`,
+             aov_dx[3][[1]]$`Pr(>F)`,
+             aov_dx[4][[1]]$`Pr(>F)`,
+             aov_dx[5][[1]]$`Pr(>F)`,
+             aov_dx[6][[1]]$`Pr(>F)`) %>% as.data.frame()
+  
+  colnames(F_values) <- rownames(aov_dx[1][[1]])
+  colnames(P_values) <- rownames(aov_dx[1][[1]])
+   
+  num_pred <- length(F_values)
+  
+  F_values_long <- F_values %>%
+    pivot_longer(cols = everything(), values_to = "F_value" )
+  P_values_long <- P_values %>%
+    pivot_longer(cols = everything(), values_to = "P_value" )
+  
+  F_P_values <- cbind(F_values_long, P_values_long[,2]) 
+  
+  PC_names <- c(rep('PC1', num_pred),
+    rep('PC2', num_pred),
+    rep('PC3', num_pred),
+    rep('PC4', num_pred),
+    rep('PC5', num_pred),
+    rep('Volume', num_pred))
+
+  summary_df <- cbind(F_P_values, PC_names) # Combine F, P values and PC names
+  summary_df$ROI <- roi # Create the ROI column
+  
+  
+  # Remove white space from names
+  summary_df$name <- str_remove_all(summary_df$name, ' ')
+  summary_df$name <- summary_df$name %>% as.factor() %>% factor(levels = summary_df$name[num_pred:-1:1]) # Reverse factors
+
+  
+  # %>% factor(levels = c(""))
+  
+  summary_df <- summary_df %>%
+    filter(!(name=="Residuals")) 
+  
+  return(summary_df)
+}
+```
+
+Plot function:
+```{r}
+# summary_df <- summary_h
+
+plot_summary <- function(summary_df) {
+  # Plot (Multiple fill scales used 'Relayer' package)
+plot <- ggplot(mapping = aes(x = ROI, y = name, size = (F_value))) +
+  (geom_point(data = subset(summary_df, ROI=="Hipp"), aes(fill1 = P_adj, color=P_adj), shape=21) %>%
+     rename_geom_aes(new_aes = c("fill" = "fill1"))) +
+  # (geom_point(data = subset(summary_df, ROI=="PostHipp"), aes(fill2 = P_adj, color=P_adj), shape=21) %>%
+  #    rename_geom_aes(new_aes = c("fill" = "fill2"))) +
+  facet_wrap(~ROI) +
+  scale_distiller("fill1", 18, "P-value (adjusted)",
+                  limits = c(min(summary_df$P_value), p_thresh),
+                  direction = -1,
+                  trans = 'log10',
+                  breaks = c(min(summary_df$P_value), p_thresh),
+                  labels = c(signif(min(summary_df$P_value),2), p_thresh), 
+                  ) +
+  # scale_distiller("fill2", 11, "PostHipp P-value",
+  #                 limits = c(min(summary_df$P_value), 0.05),
+  #                 direction = -1,
+  #                 trans = 'log10',
+  #                 breaks = c(min(summary_df$P_value), 0.05),
+  #                 labels = c(signif(min(summary_df$P_value),2), 0.05), 
+  #                 ) +
+  scale_color_gradientn(colours = 'black',
+                        limits = c(min(summary_df$P_value), p_thresh),
+                        na.value='grey95',
+                        guide = 'none'
+  ) +
+  scale_size_continuous(name = "F-value",
+                        range = c(1, 10),
+                        breaks = c(5, 10, 15, 20, 25, 30)) +
+  theme(
+    legend.position = "bottom",
+    # legend.direction = "vertical",
+    legend.box = "horizontal",
+    # legend.text.align = 0,
+        panel.background = element_blank(),
+        panel.grid = element_blank(),
+        axis.ticks = element_blank(),
+        axis.text = element_text(size = 12),
+        axis.text.x = element_text(angle = 45, hjust = 0, vjust = 0),
+        axis.title = element_text(size=0),
+        legend.spacing.x = unit(0.5, 'cm'),
+        legend.key=element_blank()
+        # aspect.ratio=4/3,
+    ) + 
+  guides(
+  fill1=guide_colorbar(available_aes = c("fill1"), 
+                        order=2,
+                        nrow=2,
+                        title.position = 'top', 
+                        label = TRUE, 
+                         label.theme = element_text(size = 7, angle = 45, hjust = 1, vjust = 1),
+                        draw.llim = FALSE
+                        ),
+  
+  fill2=guide_colorbar(available_aes = c("fill2"),
+                         order=3, 
+                         nrow=2,
+                         title.position = 'top', 
+                         label = TRUE, 
+                         label.theme = element_text(size = 7, angle = 45, hjust = 1, vjust = 1)),
+  size=guide_legend(order=1)) +
+  scale_x_discrete(position = "top",
+                   expand = c(0, 0.9),
+                   labels = element_blank()) +
+  facet_grid(~PC_names)
+
+plot
+
+return(plot)
+}
+
+```
+
+```{r}
+summary_h <- prep_summary(anovas_hipp, "Hipp", dx = "Dx4")
+
+predictor_names <- c("ICV","Education","Sex","Age","Group")
+levels(summary_h$name) <- predictor_names
+
+fdr_thresh <- p.fdr(summary_h$P_value, threshold=p_thresh)
+summary(fdr_thresh)
+plot(fdr_thresh)
+
+summary_h$P_adj <- fdr_thresh$`Results Matrix`$`Adjusted p-values`
+
+plot_all <- plot_summary(summary_h)
+plot_all + 
+  ggtitle("Across all groups") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# 
+# ggsave("../figs/biomarker_comparison_all_4Dx.png",
+#        width = 8,
+#        height = 5,
+#        # units = "px"
+#        )
+```
+
+## Separate diagnostic groups
+```{r}
+summary_h_cn <- prep_summary(anovas_hipp, "Hipp", dx = "cn")
+
+predictor_names <- c("ICV","Education","Sex","Age","Group")
+levels(summary_h_cn$name) <- predictor_names
+
+fdr_thresh <- p.fdr(summary_h_cn$P_value, threshold=p_thresh)
+summary(fdr_thresh)
+plot(fdr_thresh)
+
+summary_h_cn$P_adj <- fdr_thresh$`Results Matrix`$`Adjusted p-values`
+
+plot_all <- plot_summary(summary_h_cn)
+plot_all + 
+  ggtitle("Across Healthy and Preclinical groups") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# 
+# ggsave("../figs/biomarker_comparison_cn_4Dx.png",
+#        width = 8,
+#        height = 5,
+#        # units = "px"
+#        )
+```
+
+### MCI plot
+```{r}
+summary_h_mci <- prep_summary(anovas_hipp, "Hipp", dx = "mci")
+
+predictor_names <- c("ICV","Education","Sex","Age","Group")
+levels(summary_h_mci$name) <- predictor_names
+
+fdr_thresh <- p.fdr(summary_h_mci$P_value, threshold=p_thresh)
+summary(fdr_thresh)
+plot(fdr_thresh)
+
+summary_h_mci$P_adj <- fdr_thresh$`Results Matrix`$`Adjusted p-values`
+
+plot_all <- plot_summary(summary_h_mci)
+plot_all + 
+  ggtitle("Across Healthy and MCI groups") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# 
+# ggsave("../figs/biomarker_comparison_mci_4Dx.png",
+#        width = 8,
+#        height = 5,
+#        # units = "px"
+#        )
+```
+
+### Dementia stats plot
+```{r}
+summary_h_dem <- prep_summary(anovas_hipp, "Hipp", dx = "dem")
+
+predictor_names <- c("ICV","Education","Sex","Age","Group")
+levels(summary_h_dem$name) <- predictor_names
+
+fdr_thresh <- p.fdr(summary_h_dem$P_value, threshold=p_thresh)
+summary(fdr_thresh)
+plot(fdr_thresh)
+
+summary_h_dem$P_adj <- fdr_thresh$`Results Matrix`$`Adjusted p-values`
+
+plot_all <- plot_summary(summary_h_dem)
+plot_all + 
+  ggtitle("Across Healthy and Dementia groups") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# 
+# ggsave("../figs/biomarker_comparison_dem_4Dx.png",
+#        width = 8,
+#        height = 5,
+#        # units = "px"
+#        )
+```
+### Extra Post hoc comparisons
+
+Presympt vs MCI
+```{r}
+summary_pm <- prep_summary(anovas_hipp, "Hipp", dx = "pm")
+
+predictor_names <- c("ICV","Education","Sex","Age","Group")
+levels(summary_pm$name) <- predictor_names
+
+fdr_thresh <- p.fdr(summary_pm$P_value, threshold=p_thresh)
+summary(fdr_thresh)
+plot(fdr_thresh)
+
+summary_pm$P_adj <- fdr_thresh$`Results Matrix`$`Adjusted p-values`
+
+plot_all <- plot_summary(summary_pm)
+plot_all + 
+  ggtitle("Across Presymptomatic and MCI groups") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+MCI vs Dem
+```{r}
+summary_md <- prep_summary(anovas_hipp, "Hipp", dx = "md")
+
+predictor_names <- c("ICV","Education","Sex","Age","Group")
+levels(summary_md$name) <- predictor_names
+
+fdr_thresh <- p.fdr(summary_md$P_value, threshold=p_thresh)
+summary(fdr_thresh)
+plot(fdr_thresh)
+
+summary_md$P_adj <- fdr_thresh$`Results Matrix`$`Adjusted p-values`
+
+plot_all <- plot_summary(summary_md)
+plot_all + 
+  ggtitle("Across MCI and Dementia groups") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+Presympt vs Dem
+```{r}
+summary_pd <- prep_summary(anovas_hipp, "Hipp", dx = "pd")
+
+predictor_names <- c("ICV","Education","Sex","Age","Group")
+levels(summary_pd$name) <- predictor_names
+
+fdr_thresh <- p.fdr(summary_pd$P_value, threshold=p_thresh)
+summary(fdr_thresh)
+plot(fdr_thresh)
+
+summary_pd$P_adj <- fdr_thresh$`Results Matrix`$`Adjusted p-values`
+
+plot_all <- plot_summary(summary_pd)
+plot_all + 
+  ggtitle("Across Presymptomatic and Dementia groups") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+# Save data for publication figures
+```{r, eval=FALSE}
+save(fu_dataset, summary_h, summary_h_cn, summary_h_mci, summary_h_dem, 
+     summary_pm, summary_md, summary_pd,
+     anovas_hipp, 
+     file = "../Publication figures/data/compare_rate_of_change.Rdata")
+```

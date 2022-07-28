@@ -1,0 +1,125 @@
+---
+title: "Combine_adnimerge_TA_data_allADNI"
+author: "Alfie Wearn"
+date: "25/03/2022"
+output: pdf_document
+---
+```{r}
+# This will add Texture Analysis results to ADNIMERGE data sheet. 
+# Result will be the ability to plot and analyse the ADNI data 
+# in relation to TA to your heart's content. However, ADNI1 data should not be excluded at this point.
+# ppts with bad ASHS data should not be given ASHS data, but should not be removed entirely (other variables should remain)
+
+# Written by Alfie Wearn 2021-07-21.
+library(tidyverse)
+
+# Identify the data directories
+adni_dir <- "/Users/alfiewearn/MRIdata/ADNI/Clinical_Data"
+ashs_dir <- "/Users/alfiewearn/MRIdata/ADNI/ASHS_output/T1_only"
+ta_data_dir <- "../data" # Assumes R project is in ADNI/texture_analysis_processing/code
+```
+
+Will you exclude bad ASHS participants? 
+```{r}
+exclude_bad_ashs = TRUE
+```
+
+
+# Read in data files
+```{r}
+adnimerge <- read.csv(paste(adni_dir,"/../adnimerge_update/Mar2022/ADNIMERGE.csv", sep=""))
+av1451_data <- read.csv(paste(adni_dir,"/UCBERKELEYAV1451_01_14_21.csv", sep="")) # AV45 data
+# av45_data <- read.csv(paste(adni_dir,"/UCBERKELEYAV45_01_14_21.csv", sep="")) # AV45 data
+# fbb_data <- read.csv(paste(adni_dir,"/UCBERKELEYFBB_01_14_21.csv", sep="")) # FBB
+```
+
+
+```{r}
+ta_data <- read.csv(paste(ta_data_dir, "/ta_stats_z_denoise.csv", sep=""))
+```
+
+# Remove an erroneous row from ADNIMERGE
+RID 6014 has both 'bl' and 'm0'. m0 is identical to 'bl' but is not the correct format, and appears to just be a duplicate. Delete this row.
+```{r}
+adnimerge <- adnimerge %>%
+  filter(!(RID=='6014' & VISCODE=='m0'))
+```
+
+
+Exclude bad ashs
+```{r}
+if (exclude_bad_ashs==TRUE) {
+  exclusions <- read.csv(paste(ashs_dir,"/bad_ASHS.csv", sep=""), header=FALSE)
+  
+  # Give column names to exclusions file
+  colnames(exclusions) <- c("PTID","VISCODE")
+  
+  # Delete volume and TA data for people and sessions in exclusions (keep Region and Bins columns though)
+  bad_data <- ta_data %>%
+    right_join(exclusions, by = c("PTID","VISCODE")) 
+  bad_data[,5:length(bad_data)] <- NA
+  
+  ta_data_good <- ta_data %>%
+    anti_join(bad_data, by = c("PTID","VISCODE","Region","bins")) %>%
+    rbind(bad_data) %>%
+    distinct
+  
+  merged_data <- merge(adnimerge, ta_data_good,  by = c("PTID", "VISCODE"), all.x = TRUE) %>% distinct()
+} else {
+  merged_data <- merge(adnimerge, ta_data, by = c("PTID", "VISCODE"))  %>% distinct()
+}
+```
+
+
+```{r}
+# Remove non numeric characters from certain columns
+merged_data$TAU <- str_replace_all(merged_data$TAU, "<", "") %>% as.double()
+merged_data$PTAU <- str_replace_all(merged_data$PTAU, "<", "") %>% as.double()
+merged_data$ABETA <- str_replace_all(merged_data$ABETA, ">", "") %>% as.double()
+
+# Change glrlm_LRLGLE to a double, not a factor (why is it even a factor...?)
+merged_data$glrlm_LRLGLE <- merged_data$glrlm_LRLGLE %>% as.character() %>% as.double() 
+
+
+# CHANGE DATA TO NUMERIC
+first_TA_col_md <- which(colnames(merged_data)=="Volume") %>% as.integer()
+last_TA_col_md <- which(colnames(merged_data)=="glrlm_LRLGLE") %>% as.integer()
+
+# change all TA columns to numeric.
+merged_data[,first_TA_col_md:last_TA_col_md] <- sapply(merged_data[,first_TA_col_md:last_TA_col_md],as.numeric) %>% as.data.frame()
+```
+
+
+# Merge in Florbetapir and Florbetapen (former just to compare, latter for calculation of centiloids)
+This does not need to be done if using ADNIMERGE from March2022 (or later), as FBB is already included!
+```{r, eval = FALSE}
+av45_data_to_merge <- av45_data %>% select(RID, VISCODE2, SUMMARYSUVR_WHOLECEREBNORM) %>% rename(VISCODE = VISCODE2)
+new_merge <- merge(av45_data_to_merge, merged_data, by=c("RID","VISCODE"), all.y=TRUE) %>% rename(AV45_raw = SUMMARYSUVR_WHOLECEREBNORM)
+
+fbb_data_to_merge <- fbb_data %>% select(RID, VISCODE2, SUMMARYSUVR_WHOLECEREBNORM) %>% rename(VISCODE = VISCODE2)
+new_merge_fbb <- merge(fbb_data_to_merge, new_merge, by=c("RID","VISCODE"), all.y=TRUE) %>% rename(FBB_raw = SUMMARYSUVR_WHOLECEREBNORM)
+
+merged_data <- new_merge_fbb %>% relocate(AV45_raw, FBB_raw, .after=AV45)
+```
+
+Get AV1451 info (Flortaucipir) - Tau PET.
+```{r}
+av1451_data_to_merge <- av1451_data %>% select(RID, VISCODE2, META_TEMPORAL_SUVR) %>% rename(VISCODE = VISCODE2)
+new_merge <- merge(av1451_data_to_merge, merged_data, by=c("RID","VISCODE"), all.y=TRUE) %>% rename(AV1451 = META_TEMPORAL_SUVR)
+
+merged_data <- new_merge %>% relocate(AV1451, .after=FBB)
+```
+
+
+# SAVE THE DATA 
+```{r}
+write.csv(merged_data, file = "../data/merged_data.csv",row.names = FALSE)
+saveRDS(merged_data, file = "../data/merged_data.Rdata")
+```
+
+
+```{r}
+system("say Data Merged")
+```
+
+

@@ -1,0 +1,418 @@
+---
+title: "Independent_variance"
+author: "Alfie Wearn"
+date: "25/05/2022"
+output: pdf_document
+---
+
+```{r}
+library(tidyverse)
+library(boot) # Bootstrapping
+library(ggpubr) # Panelling
+library(ggprism) # For adding p-value
+library(effectsize)
+```
+
+# Load TA data with PCs
+```{r}
+getwd()
+load(file="../data/pc_dataset.Rdata")
+
+pc_vars <- c('all_Hipp_PC1','all_Hipp_PC2','all_Hipp_PC3','all_Hipp_PC4','all_Hipp_PC5')
+
+```
+
+# Predicting Cognitive Change
+```{r}
+data <- pc_dataset %>%
+  select(PTID, RID, VISCODE, M, Month_TxBl, Month, DX_TxBl,
+         Age, PTEDUCAT, male, ICV_bl,
+         ADAS13, CDRSB, MMSE,
+         all_of(pc_vars),
+         Volume_AvgHipp) %>%
+  group_by(RID) %>%
+  mutate(Age_bl = Age[Month_TxBl==M]) %>%
+  mutate(ADAS13_bl = ADAS13[Month_TxBl==M]) %>%
+  mutate(CDRSB_bl = CDRSB[Month_TxBl==M]) %>%
+  mutate(MMSE_bl = MMSE[Month_TxBl==M]) %>%
+  mutate(Volume_AvgHipp_bl = Volume_AvgHipp[Month_TxBl==M]) %>%
+  mutate(all_Hipp_PC1_bl = all_Hipp_PC1[Month_TxBl==M]) %>%
+  mutate(all_Hipp_PC2_bl = all_Hipp_PC2[Month_TxBl==M]) %>%
+  mutate(all_Hipp_PC3_bl = all_Hipp_PC3[Month_TxBl==M]) %>%
+  mutate(all_Hipp_PC4_bl = all_Hipp_PC4[Month_TxBl==M]) %>%
+  mutate(all_Hipp_PC5_bl = all_Hipp_PC5[Month_TxBl==M]) %>%
+  ungroup() %>%
+  filter((!is.na(ADAS13) & !is.na(CDRSB) & !is.na(MMSE) &
+            !is.na(all_Hipp_PC1) & 
+            !is.na(all_Hipp_PC2) & 
+            !is.na(all_Hipp_PC3) & 
+            !is.na(all_Hipp_PC4) & 
+            !is.na(all_Hipp_PC5) &
+            !is.na(Volume_AvgHipp) &
+            !is.na(ADAS13_bl) & !is.na(CDRSB_bl) & !is.na(MMSE_bl) &
+            !is.na(all_Hipp_PC1_bl) &
+            !is.na(all_Hipp_PC2_bl) &
+            !is.na(all_Hipp_PC3_bl) &
+            !is.na(all_Hipp_PC4_bl) &
+            !is.na(all_Hipp_PC5_bl) &
+            !is.na(Volume_AvgHipp_bl)
+  )) 
+
+# For predicting cognitive decline
+data_fu <- data %>%
+  filter(!(DX_TxBl=="Dementia")) %>%
+  filter(M==Month_TxBl+24) %>%
+  mutate(ADAS13_diff = ADAS13-ADAS13_bl) %>%
+  mutate(CDRSB_diff = CDRSB-CDRSB_bl) %>%
+  mutate(MMSE_diff = MMSE-MMSE_bl)
+
+# Predicting Decline sample size
+data_fu %>%
+  group_by(DX_TxBl) %>%
+  summarise(n=n(),
+            Mage = mean(Age_bl),
+            SDage = sd(Age_bl))
+
+# For predicting age
+data_bl <- data %>%
+  filter((DX_TxBl=="CN")) %>%
+  filter(M==Month_TxBl)
+
+# Predicting age sample size
+data_bl %>%
+  summarise(n=n(),
+            Mage = mean(Age_bl),
+            SDage = sd(Age_bl))
+
+# Save ID lists
+pred_cog_change_list <- data_fu %>%
+  filter(!is.na(DX_TxBl)) %>% 
+  select(PTID, VISCODE) %>%
+  mutate(pred_cog_change = "Y")
+
+pred_age_list <- data_bl %>%
+  select(PTID, VISCODE) %>%
+  mutate(pred_age = "Y")
+
+save(pred_cog_change_list, file="../data/ID_lists/pred_cog_change_list.Rdata")
+save(pred_age_list, file="../data/ID_lists/pred_age_list.Rdata")
+```
+
+```{r}
+lm(ADAS13 ~ ADAS13_bl + Age_bl + PTEDUCAT + male + ICV_bl, data = data_fu)  %>% summary
+lm(ADAS13 ~ ADAS13_bl + Age_bl + PTEDUCAT + male + ICV_bl + Volume_AvgHipp_bl, data = data_fu) %>% summary
+lm(ADAS13 ~ ADAS13_bl + Age_bl + PTEDUCAT + male + ICV_bl + Volume_AvgHipp_bl + all_Hipp_PC1_bl + all_Hipp_PC2_bl + all_Hipp_PC3_bl + all_Hipp_PC4_bl + all_Hipp_PC5_bl, data = data_fu)  %>% summary
+```
+
+```{r}
+lm(CDRSB ~ CDRSB_bl + Age_bl + PTEDUCAT + male + ICV_bl, data = data_fu) %>% summary
+lm(CDRSB ~ CDRSB_bl + Age_bl + PTEDUCAT + male + ICV_bl + Volume_AvgHipp_bl, data = data_fu) %>% summary
+lm(CDRSB ~ CDRSB_bl + Age_bl + PTEDUCAT + male + ICV_bl + Volume_AvgHipp_bl + all_Hipp_PC1_bl + all_Hipp_PC2_bl + all_Hipp_PC3_bl + all_Hipp_PC4_bl + all_Hipp_PC5_bl, data = data_fu) %>% summary
+```
+
+```{r}
+lm(MMSE ~ MMSE_bl + Age_bl + PTEDUCAT + male + ICV_bl, data = data_fu) %>% summary
+lm(MMSE ~ MMSE_bl + Age_bl + PTEDUCAT + male + ICV_bl + Volume_AvgHipp_bl, data = data_fu) %>% summary
+lm(MMSE ~ MMSE_bl + Age_bl + PTEDUCAT + male + ICV_bl + Volume_AvgHipp_bl + all_Hipp_PC1_bl + all_Hipp_PC2_bl + all_Hipp_PC3_bl + all_Hipp_PC4_bl + all_Hipp_PC5_bl, data = data_fu) %>% summary
+```
+
+# Bootstrapping
+Uses 'boot' package: https://www.statmethods.net/advstats/bootstrapping.html 
+
+Define function to extract R2 from the model
+```{r}
+rsq <- function(formula, data, indices) {
+  d <- data[indices,] # allows boot to select sample
+  fit <- lm(formula, data=d)
+  return(summary(fit)$r.square)
+}
+
+plot_results <- function(results) {
+  colnames(results) <- c("Covars", "Covars+Volume", "Covars+Volume+Tx")
+  
+  results_long <- results %>% 
+  pivot_longer(cols = colnames(results)) 
+  
+  df_p_val <- rstatix::t_test(results_long, value ~ name) # Get p-values for t-tests
+  print(df_p_val)
+  
+  # Get y.positions for p-values
+  max_val <- max(results_long$value) 
+  # min_val <- min(results_long$value)
+  range_val <- diff(range(results_long$value))
+  ypos1 <- max_val + (range_val*0.06) # Lower one should be max + 6% of the data range
+  ypos2 <- max_val + (range_val*0.15) # Upper one should be max + 15% of the data range
+  
+  return(
+    results_long %>%
+      ggplot(aes(x=name, y = value)) +
+      geom_violin(aes(fill = name), alpha = 0.5) +
+      geom_boxplot(width=0.2) +
+      theme_classic() +
+      scale_fill_brewer(palette = "Dark2") +
+      ylab(bquote(''~R^2~'')) +
+      xlab("Model Predictors") +
+      theme(legend.position = "none") + 
+      add_pvalue(df_p_val, 
+               y.position = c(ypos2, ypos1, ypos2),
+               bracket.shorten = c(0.025, 0, 0.025))
+  )
+}
+
+# Set seed for replicability
+set.seed(123)
+```
+
+Bootstrap basic model with 1000 replications
+ADAS:
+```{r}
+# Set seed for replicability
+set.seed(123)
+
+results_basic_adas <- boot(data=data_fu, statistic=rsq,
+   R=1000, formula=ADAS13 ~ ADAS13_bl + Age_bl + PTEDUCAT + male + ICV_bl)
+boot.ci(results_basic_adas, type="bca")
+
+results_vol_adas <- boot(data=data_fu, statistic=rsq,
+   R=1000, formula=ADAS13 ~ ADAS13_bl + Age_bl + PTEDUCAT + male + ICV_bl + Volume_AvgHipp_bl)
+boot.ci(results_vol_adas, type="bca")
+
+results_vol_tx_adas <- boot(data=data_fu, statistic=rsq,
+   R=1000, formula=ADAS13 ~ ADAS13_bl + Age_bl + PTEDUCAT + male + ICV_bl + Volume_AvgHipp_bl + all_Hipp_PC1_bl + all_Hipp_PC2_bl + all_Hipp_PC3_bl + all_Hipp_PC4_bl + all_Hipp_PC5_bl)
+boot.ci(results_vol_tx_adas, type="bca")
+
+# Stick all the R2 values together into one dataframe, and plot and compare results
+results_adas <- cbind(results_basic_adas$t, results_vol_adas$t, results_vol_tx_adas$t) %>% as.data.frame()
+
+plot_adas <- plot_results(results_adas) + ggtitle("2-year ADAS13 Change")
+plot_adas 
+```
+Repeat for CDRSB:
+```{r}
+results_basic_cdrsb <- boot(data=data_fu, statistic=rsq,
+   R=1000, formula=CDRSB ~ CDRSB_bl + Age_bl + PTEDUCAT + male + ICV_bl)
+boot.ci(results_basic_cdrsb, type="bca")
+
+results_vol_cdrsb <- boot(data=data_fu, statistic=rsq,
+   R=1000, formula=CDRSB ~ CDRSB_bl + Age_bl + PTEDUCAT + male + ICV_bl + Volume_AvgHipp_bl)
+boot.ci(results_vol_cdrsb, type="bca")
+
+results_vol_tx_cdrsb <- boot(data=data_fu, statistic=rsq,
+   R=1000, formula=CDRSB ~ CDRSB_bl + Age_bl + PTEDUCAT + male + ICV_bl + Volume_AvgHipp_bl + all_Hipp_PC1_bl + all_Hipp_PC2_bl + all_Hipp_PC3_bl + all_Hipp_PC4_bl + all_Hipp_PC5_bl)
+boot.ci(results_vol_tx_cdrsb, type="bca")
+
+results_cdrsb <- cbind(results_basic_cdrsb$t, results_vol_cdrsb$t, results_vol_tx_cdrsb$t) %>% as.data.frame()
+
+plot_cdrsb <- plot_results(results_cdrsb) + ggtitle("2-year CDRSB Change")
+plot_cdrsb
+
+t.test(results_cdrsb[,1], results_cdrsb[,2])
+t.test(results_cdrsb[,1], results_cdrsb[,3])
+t.test(results_cdrsb[,2], results_cdrsb[,3])
+```
+
+Repeat for MMSE:
+```{r}
+results_basic_mmse <- boot(data=data_fu, statistic=rsq,
+   R=1000, formula=MMSE ~ MMSE_bl + Age_bl + PTEDUCAT + male + ICV_bl)
+boot.ci(results_basic_mmse, type="bca")
+
+results_vol_mmse <- boot(data=data_fu, statistic=rsq,
+   R=1000, formula=MMSE ~ MMSE_bl + Age_bl + PTEDUCAT + male + ICV_bl + Volume_AvgHipp_bl)
+boot.ci(results_vol_mmse, type="bca")
+
+results_vol_tx_mmse <- boot(data=data_fu, statistic=rsq,
+   R=1000, formula=MMSE ~ MMSE_bl + Age_bl + PTEDUCAT + male + ICV_bl + Volume_AvgHipp_bl + all_Hipp_PC1_bl + all_Hipp_PC2_bl + all_Hipp_PC3_bl + all_Hipp_PC4_bl + all_Hipp_PC5_bl)
+boot.ci(results_vol_tx_mmse, type="bca")
+
+results_mmse <- cbind(results_basic_mmse$t, results_vol_mmse$t, results_vol_tx_mmse$t) %>% as.data.frame()
+
+plot_mmse <- plot_results(results_mmse) + ggtitle("2-year MMSE Change")
+plot_mmse
+
+t.test(results_mmse[,1], results_mmse[,2])
+t.test(results_mmse[,1], results_mmse[,3])
+t.test(results_mmse[,2], results_mmse[,3])
+```
+
+# Calculating difference score
+The R2 doesn't change much because baseline predicts so strongly. Try calculating score difference at every time point
+ADAS:
+```{r, eval=FALSE}
+lm(ADAS13_diff ~ Age_bl + PTEDUCAT + male + ICV_bl, data = data_fu) %>% summary
+lm(ADAS13_diff ~ Age_bl + PTEDUCAT + male + ICV_bl + Volume_AvgHipp_bl, data = data_fu) %>% summary
+lm(ADAS13_diff ~ Age_bl + PTEDUCAT + male + ICV_bl + Volume_AvgHipp_bl + all_Hipp_PC1_bl + all_Hipp_PC2_bl + all_Hipp_PC3_bl + all_Hipp_PC4_bl + all_Hipp_PC5_bl, data = data_fu) %>% summary
+```
+CDR:
+```{r, eval=FALSE}
+lm(CDRSB_diff ~ Age_bl + PTEDUCAT + male, data = data_fu) %>% summary
+lm(CDRSB_diff ~ Age_bl + PTEDUCAT + male + Volume_AvgHipp_bl, data = data_fu) %>% summary
+lm(CDRSB_diff ~ Age_bl + PTEDUCAT + male + Volume_AvgHipp_bl + all_Hipp_PC1_bl + all_Hipp_PC2_bl + all_Hipp_PC3_bl + all_Hipp_PC4_bl + all_Hipp_PC5_bl, data = data_fu) %>% summary
+```
+MMSE:
+```{r, eval=FALSE}
+lm(MMSE_diff ~ Age_bl + PTEDUCAT + male, data = data_fu) %>% summary
+lm(MMSE_diff ~ Age_bl + PTEDUCAT + male + Volume_AvgHipp_bl, data = data_fu) %>% summary
+lm(MMSE_diff ~ Age_bl + PTEDUCAT + male + Volume_AvgHipp_bl + all_Hipp_PC1_bl + all_Hipp_PC2_bl + all_Hipp_PC3_bl + all_Hipp_PC4_bl + all_Hipp_PC5_bl, data = data_fu) %>% summary
+```
+
+## Train/Test sets, then compare median absolute errors
+```{r, eval=FALSE}
+# Then train the model freshly on 80% (training data) + Baseline sessions of test set. Then, Add follow-up timepoints from the test set, and use predict function to predict that. 
+set.seed(123)
+
+all_ids <- data_fu$RID %>% unique
+samp_id <- sample(all_ids, length(all_ids)*0.8)
+
+data_train <- data_fu %>%
+  filter(RID %in% samp_id)
+
+data_test <- data_fu %>%
+  filter(!(RID %in% samp_id))
+
+```
+
+
+Train the mode on the training set
+```{r, eval=FALSE}
+model <- lm(ADAS13 ~ ADAS13_bl + Age_bl + PTEDUCAT + male + ICV_bl, data = data_train)
+data_test$ADAS13_pred <- predict(model,data_test, level = 0)
+data_test$ADAS13_error <- data_test$ADAS13_pred - data_test$ADAS13
+abs(data_test$ADAS13_error) %>% median(na.rm=TRUE)
+
+model <- lm(ADAS13 ~ ADAS13_bl + Age_bl + PTEDUCAT + male + ICV_bl + Volume_AvgHipp_bl, data = data_train)
+data_test$ADAS13_pred <- predict(model,data_test, level = 0)
+data_test$ADAS13_error <- data_test$ADAS13_pred - data_test$ADAS13
+abs(data_test$ADAS13_error) %>%  median(na.rm=TRUE)
+
+model <- lm(ADAS13 ~ ADAS13_bl + Age_bl + PTEDUCAT + male + ICV_bl + Volume_AvgHipp_bl + all_Hipp_PC1_bl + all_Hipp_PC2_bl + all_Hipp_PC3_bl + all_Hipp_PC4_bl + all_Hipp_PC5_bl, data = data_train)
+data_test$ADAS13_pred <- predict(model,data_test, level = 0)
+data_test$ADAS13_error <- data_test$ADAS13_pred - data_test$ADAS13
+abs(data_test$ADAS13_error) %>%  median(na.rm=TRUE)
+```
+
+```{r, eval=FALSE}
+model <- lm(CDRSB ~ CDRSB_bl + Age_bl + PTEDUCAT + male + ICV_bl, data = data_train)
+data_test$CDRSB_pred <- predict(model,data_test, level = 0)
+data_test$CDRSB_error <- data_test$CDRSB_pred - data_test$CDRSB
+abs(data_test$CDRSB_error) %>%  median(na.rm=TRUE)
+
+model <- lm(CDRSB ~ CDRSB_bl + Age_bl + PTEDUCAT + male + ICV_bl + Volume_AvgHipp_bl, data = data_train)
+data_test$CDRSB_pred <- predict(model,data_test, level = 0)
+data_test$CDRSB_error <- data_test$CDRSB_pred - data_test$CDRSB
+abs(data_test$CDRSB_error) %>%  median(na.rm=TRUE)
+
+model <- lm(CDRSB ~ CDRSB_bl + Age_bl + PTEDUCAT + male + ICV_bl + Volume_AvgHipp_bl + all_Hipp_PC1_bl + all_Hipp_PC2_bl + all_Hipp_PC3_bl + all_Hipp_PC4_bl + all_Hipp_PC5_bl, data = data_train)
+data_test$CDRSB_pred <- predict(model,data_test, level = 0)
+data_test$CDRSB_error <- data_test$CDRSB_pred - data_test$CDRSB
+abs(data_test$CDRSB_error) %>%  median(na.rm=TRUE)
+```
+
+```{r, eval=FALSE}
+model <- lm(MMSE ~ MMSE_bl + Age_bl + PTEDUCAT + male + ICV_bl, data = data_train)
+data_test$MMSE_pred <- predict(model,data_test, level = 0)
+data_test$MMSE_error <- data_test$MMSE_pred - data_test$MMSE
+abs(data_test$MMSE_error) %>%  median(na.rm=TRUE)
+
+model <- lm(MMSE ~ MMSE_bl + Age_bl + PTEDUCAT + male + ICV_bl + Volume_AvgHipp_bl, data = data_train)
+data_test$MMSE_pred <- predict(model,data_test, level = 0)
+data_test$MMSE_error <- data_test$MMSE_pred - data_test$MMSE
+abs(data_test$MMSE_error) %>%  median(na.rm=TRUE)
+
+model <- lm(MMSE ~ MMSE_bl + Age_bl + PTEDUCAT + male + ICV_bl + Volume_AvgHipp_bl + all_Hipp_PC1_bl + all_Hipp_PC2_bl + all_Hipp_PC3_bl + all_Hipp_PC4_bl + all_Hipp_PC5_bl, data = data_train)
+data_test$MMSE_pred <- predict(model,data_test, level = 0)
+data_test$MMSE_error <- data_test$MMSE_pred - data_test$MMSE
+abs(data_test$MMSE_error) %>%  median(na.rm=TRUE)
+```
+
+
+# Predicting Age 
+```{r}
+lm(Age_bl ~ PTEDUCAT + male + ICV_bl, data = data_bl)  %>% summary
+lm(Age_bl ~ PTEDUCAT + male + ICV_bl + Volume_AvgHipp_bl, data = data_bl)  %>% summary
+lm(Age_bl ~ PTEDUCAT + male + ICV_bl + Volume_AvgHipp_bl + all_Hipp_PC1_bl + all_Hipp_PC2_bl + all_Hipp_PC3_bl + all_Hipp_PC4_bl + all_Hipp_PC5_bl, data = data_bl)  %>% summary
+
+results_basic_age <- boot(data=data_bl, statistic=rsq,
+   R=1000, formula=Age_bl ~ PTEDUCAT + male + ICV_bl)
+
+results_vol_age <- boot(data=data_bl, statistic=rsq,
+   R=1000, formula=Age_bl ~ PTEDUCAT + male + ICV_bl + Volume_AvgHipp_bl)
+
+results_vol_tx_age <- boot(data=data_bl, statistic=rsq,
+   R=1000, formula=Age_bl ~ PTEDUCAT + male + ICV_bl + Volume_AvgHipp_bl + all_Hipp_PC1_bl + all_Hipp_PC2_bl + all_Hipp_PC3_bl + all_Hipp_PC4_bl + all_Hipp_PC5_bl)
+
+results_age <- cbind(results_basic_age$t, results_vol_age$t, results_vol_tx_age$t) %>% as.data.frame()
+
+plot_age <- plot_results(results_age) + ggtitle("Age at baseline")
+plot_age
+
+t.test(results_age[,1], results_age[,2])
+t.test(results_age[,1], results_age[,3])
+t.test(results_age[,2], results_age[,3])
+```
+
+Panelling plots
+```{r}
+ggarrange(plot_adas, plot_cdrsb, plot_mmse, plot_age, labels = c("A","B","C","D"))
+
+ggsave(filename="../figs/R2_Change_Predict_Age_CogDecline.pdf",
+       width = 8, 
+       height = 8)
+
+```
+
+
+# Code graveyard
+```{r, eval=FALSE}
+bl_dataset <- pc_dataset %>%
+  filter(!is.na(DX_TxBl)) %>% 
+  filter(Month_TxBl-Month==0) %>%
+  # filter(M==0) %>%
+  # filter(!is.na(PTAU_status)) %>%
+  # filter(!is.na(PTAU_ABETA_status)) %>%
+  filter(!is.na(ABETA_status)) %>%
+  group_by(RID) %>%
+  mutate(Age_TA_bl = min(Age), .after = Age) %>%
+  ungroup()
+```
+
+
+Do texture an volume explain different variance in predicting: Age, Amyloid Status, or group?
+```{r, eval=FALSE}
+bl_dataset$SITE <- as.factor(bl_dataset$SITE)
+  bl_dataset$male <- as.factor(bl_dataset$male)
+  bl_dataset$Age_TA_bl <- scale(bl_dataset$Age_TA_bl)
+  bl_dataset$PTEDUCAT <- scale(bl_dataset$PTEDUCAT)
+  bl_dataset$ICV_bl <- scale(bl_dataset$ICV_bl)
+  bl_dataset$Volume_AvgHipp <- scale(bl_dataset$Volume_AvgHipp)
+  
+  
+  bl_dataset$all_Hipp_PC1 <- remove_outliers(bl_dataset$all_Hipp_PC1)
+  bl_dataset$all_Hipp_PC2 <- remove_outliers(bl_dataset$all_Hipp_PC2)
+  bl_dataset$all_Hipp_PC3 <- remove_outliers(bl_dataset$all_Hipp_PC3)
+  bl_dataset$all_Hipp_PC4 <- remove_outliers(bl_dataset$all_Hipp_PC4)
+  bl_dataset$all_Hipp_PC5 <- remove_outliers(bl_dataset$all_Hipp_PC5)
+```
+
+
+```{r, eval=FALSE}
+mod_null <-  lm(Age_TA_bl ~ male + PTEDUCAT + ICV_bl, data = bl_dataset)
+summary(mod_null)
+
+mod_vol <- lm(Age_TA_bl ~ Volume_AvgHipp + male + PTEDUCAT + ICV_bl, data = bl_dataset)
+summary(mod_vol)
+
+mod_vol_h4 <- lm(Age_TA_bl ~  all_Hipp_PC4 + Volume_AvgHipp + male + PTEDUCAT + ICV_bl, data = bl_dataset)
+summary(mod_vol_h4)
+
+mod_vol_h1 <- lm(Age_TA_bl ~  all_Hipp_PC1 + Volume_AvgHipp + male + PTEDUCAT + ICV_bl, data = bl_dataset)
+summary(mod_vol_h1)
+
+mod_vol_h12 <- lm(Age_TA_bl ~  all_Hipp_PC1 + all_Hipp_PC2 + Volume_AvgHipp + male + PTEDUCAT + ICV_bl, data = bl_dataset)
+summary(mod_vol_h12)
+
+mod_vol_h12345 <- lm(Age_TA_bl ~  all_Hipp_PC1 + all_Hipp_PC2 + all_Hipp_PC3 + all_Hipp_PC4 + all_Hipp_PC5 + Volume_AvgHipp + male + PTEDUCAT + ICV_bl, data = bl_dataset)
+summary(mod_vol_h12345)
+
+```
+

@@ -1,0 +1,403 @@
+---
+title: "Create_models"
+author: "Alfie Wearn"
+date: "10/03/2022"
+output: pdf_document
+---
+
+Based on Lars' send code 'Mulvar_Modelling_LLR', this script uses splines to model trajectory of texture variables
+
+Load packages and data
+```{r}
+library(progmod)
+library(tidyverse)
+library(R.utils) # For 'insert' function
+
+spline_mean <- function(t, s, a1, a2, a3, a4, a5) {
+  a <- c(a1[1], a1[1], a2[1], a3[1], a4[1], a5[1], a5[1])
+  mf <- splinefun(x = c(-101, seq(-100, 200, length = 5), 201),  # Anchor points should be chosen to match the data range
+                  y = a, 
+                  method = 'natural')
+  
+  mf(t + s)
+}
+```
+Load data
+```{r}
+load(file="../data/prepped_data.Rdata")
+data <- selected_data
+```
+ 
+
+Get sample size info
+```{r}
+# All - 3 groups
+data %>%
+  filter(RID != 4386) %>% # The one with absurd values for AV45...
+  filter(!is.na(CDRSB) | !is.na(MMSE) | !is.na(ADAS13) | !is.na(AB_centiloid)) %>% #  Only one of each variable required
+  group_by(RID) %>%
+  filter(M == min(M)) %>% # pick one session for each subject to count total subjects
+  ungroup() %>%
+  group_by(DX_baseline) %>%
+  summarise(n=n(),
+            Mage = mean(Age_bl),
+            SDage = sd(Age_bl))
+
+# All with amyloid - 3 groups
+data %>%
+  filter(RID != 4386) %>% # The one with absurd values for AV45...
+  filter(!is.na(CDRSB) | !is.na(MMSE) | !is.na(ADAS13) | !is.na(AB_centiloid)) %>% #  Only one of each variable required
+  filter(!is.na(DX_baseline_Ab)) %>%
+  group_by(RID) %>%
+  filter(M == min(M)) %>% # pick one session for each subject to count total subjects
+  ungroup() %>%
+  group_by(DX_baseline) %>%
+  summarise(n=n(),
+            Mage = mean(Age_bl),
+            SDage = sd(Age_bl))
+
+# All with amyloid - 4 groups
+data %>%
+  filter(RID != 4386) %>% # The one with absurd values for AV45...
+  filter(!is.na(CDRSB) | !is.na(MMSE) | !is.na(ADAS13) | !is.na(AB_centiloid)) %>% #  Only one of each variable required
+  group_by(RID) %>%
+  filter(M == min(M)) %>% # pick one session for each subject to count total subjects
+  ungroup() %>%
+  group_by(DX_baseline_Ab) %>%
+  summarise(n=n(),
+            Mage = mean(Age_bl),
+            SDage = sd(Age_bl))
+
+# How many sessions? 2356
+data %>%
+  filter(RID != 4386) %>% # The one with absurd values for AV45...
+  filter(!is.na(CDRSB) | !is.na(MMSE) | !is.na(ADAS13) | !is.na(AB_centiloid)) %>% #  Only one of each variable required
+  nrow()
+
+# Save ID list
+model_train_list <- data %>%
+  filter(RID != 4386) %>% # The one with absurd values for AV45...
+  filter(!is.na(CDRSB) | !is.na(MMSE) | !is.na(ADAS13) | !is.na(AB_centiloid)) %>% #  Only one of each variable required
+  filter(!is.na(DX_baseline_Ab)) %>%
+  select(PTID, VISCODE) %>%
+  mutate(model_train_subset = "Y")
+
+save(model_train_list, file="../data/ID_lists/model_train_list.Rdata")
+```
+
+
+Make long dataset with relevant variables
+```{r}
+prog_dat <- data[, c('RID', 
+                     'Age_bl',
+                     'male',
+                     'PRE', 'MCI', 'DEM',  
+                     'Month_bl',
+                     'MMSE', 'CDRSB', 'ADAS13', 'AB_centiloid')]
+
+# Remove v high AV45 value
+prog_dat <- prog_dat %>%
+  filter(RID != 4386) # The one with absurd values for AV45...
+hist(prog_dat$AB_centiloid)
+
+prog_dat <- pivot_longer(prog_dat, cols = c('MMSE', 'CDRSB', 'ADAS13','AB_centiloid'))
+prog_dat <- na.omit(prog_dat)
+prog_dat$name <- factor(prog_dat$name)
+```
+
+
+Fit univariate model
+```{r}
+start_coef <- c(l = 0.14, 
+                s.PRE = 39, s.MCI = 123, s.DEM = 178,
+                g = 3.6, 
+                v = 10)
+
+mod_adas_yr <- progmod(value ~ exp_model(Month_bl, l, s, g, v),
+                       data = subset(prog_dat, name == 'ADAS13'),
+                       fixed = list(l ~ 1,
+                                    s ~ PRE + MCI + DEM + 0,
+                                    g ~ 1,
+                                    v ~ 1),
+                       random = s + v ~ 1 | RID,
+                       start = start_coef)
+
+AIC(mod_adas_yr) # Using continuous time is best
+fixed.effects(mod_adas_yr)
+```
+
+
+Fit joint multivariate model on clinical scales
+```{r}
+start_coef <- c(l.nameADAS13 = 0.14, l.nameCDRSB = 0.019, l.nameMMSE = -0.01, 
+                s.PRE = 39, s.MCI = 123, s.DEM = 178, s.Age_bl = 1,
+                g.nameADAS13 = 3.8, g.nameCDRSB = 3.7, g.nameMMSE = 3.5, 
+                v.nameADAS13 = 10.2, v.nameCDRSB = 0.29, v.nameMMSE = 29)
+
+random_start <- random.effects(mod_adas_yr)
+names(random_start)[2] <- 'v.nameADAS13'
+random_start$`v.nameCDRSB` <- 0
+random_start$`v.nameMMSE` <- 0
+
+mod_joint_cog <- nlme(value ~ exp_model(Month_bl, l, s, g, v),
+                      data = subset(prog_dat, name %in% c('MMSE', 'CDRSB', 'ADAS13')),
+                      fixed = list(l ~ name + 0,
+                                   s ~ PRE + MCI + DEM + Age_bl + 0,
+                                   g ~ name + 0,
+                                   v ~ name + 0),
+                      random = list(s ~ 1,
+                                    v ~ name + 0),
+                      groups = ~ RID,
+                      start = list(fixed = start_coef,
+                                   random = random_start),
+                      weights = varIdent(form = ~ 1 | name),
+                      control = nlmeControl(pnlsMaxIter = 100,
+                                            niterEM = 100,
+                                            msMaxIter = 100))
+fixed.effects(mod_joint_cog)
+```
+
+
+# Spline model
+```{r}
+fixed_start_coef <- c(a1_adas = 0, a2_adas = 12, a3_adas = 12, a4_adas = 30, a5_adas = 73, 
+                      a1_cdrsb = 0, a2_cdrsb = 0.64, a3_cdrsb = 1, a4_cdrsb = 4.8, a5_cdrsb = 18, 
+                      a1_mmse = 30, a2_mmse = 27, a3_mmse = 25, a4_mmse = 23, a5_mmse = 4.7, 
+                      s.PRE = 37, s.MCI = 102, s.DEM = 164, s.Age_bl = 0)
+
+random_start <- random.effects(mod_joint_cog)
+names(random_start)[2:4] <- c('k.nameADAS13', 'k.nameCDRSB', 'k.nameMMSE')
+random_start[, 2:4] <- 0
+
+mod_joint_cog_spline <- nlme(value ~ as.numeric(name == 'ADAS13') * spline_mean(Month_bl, s, a1_adas, a2_adas, a3_adas, a4_adas, a5_adas) +
+                               as.numeric(name == 'CDRSB') * spline_mean(Month_bl, s, a1_cdrsb, a2_cdrsb, a3_cdrsb, a4_cdrsb, a5_cdrsb) +
+                               as.numeric(name == 'MMSE') * spline_mean(Month_bl, s, a1_mmse, a2_mmse, a3_mmse, a4_mmse, a5_mmse) + k,
+                             data = subset(prog_dat, name %in% c('ADAS13', 'CDRSB', 'MMSE')),
+                             fixed = list(a1_adas + a2_adas + a3_adas + a4_adas + a5_adas ~ 1,
+                                          a1_cdrsb + a2_cdrsb + a3_cdrsb + a4_cdrsb + a5_cdrsb ~ 1,
+                                          a1_mmse + a2_mmse + a3_mmse + a4_mmse + a5_mmse ~ 1,
+                                          s ~ PRE + MCI + DEM + Age_bl + 0),
+                             random = list(s ~ 1,
+                                           k ~ name + 0),
+                             groups = ~ RID,
+                             start = list(fixed = fixed_start_coef,
+                                          random = random_start
+                             ),
+                             weights = varIdent(form = ~ 1 | name),
+                             control = nlmeControl(msMaxIter = 100))
+
+# system("say spline model done")
+
+AIC(mod_joint_cog) # 82860.49
+AIC(mod_joint_cog_spline) # 82589.59
+
+fixed.effects(mod_joint_cog_spline)
+```
+
+```{r}
+fixed_start_coef <- c(a1_adas = 0, a2_adas = 12, a3_adas = 12, a4_adas = 30, a5_adas = 73, 
+                      a1_cdrsb = 0, a2_cdrsb = 0.64, a3_cdrsb = 1, a4_cdrsb = 4.8, a5_cdrsb = 18, 
+                      a1_mmse = 30, a2_mmse = 27, a3_mmse = 25, a4_mmse = 23, a5_mmse = 4.7, 
+                      s.PRE = 37, s.MCI = 102, s.DEM = 164, s.Age_bl = 0, k.Age_bl = 0)
+
+random_start <- random.effects(mod_joint_cog)
+names(random_start)[2:4] <- c('k.nameADAS13', 'k.nameCDRSB', 'k.nameMMSE')
+random_start[, 2:4] <- 0
+
+mod_joint_cog_spline_AgeK <- nlme(value ~ as.numeric(name == 'ADAS13') * spline_mean(Month_bl, s, a1_adas, a2_adas, a3_adas, a4_adas, a5_adas) +
+                               as.numeric(name == 'CDRSB') * spline_mean(Month_bl, s, a1_cdrsb, a2_cdrsb, a3_cdrsb, a4_cdrsb, a5_cdrsb) +
+                               as.numeric(name == 'MMSE') * spline_mean(Month_bl, s, a1_mmse, a2_mmse, a3_mmse, a4_mmse, a5_mmse) + k,
+                             data = subset(prog_dat, name %in% c('ADAS13', 'CDRSB', 'MMSE')),
+                             fixed = list(a1_adas + a2_adas + a3_adas + a4_adas + a5_adas ~ 1,
+                                          a1_cdrsb + a2_cdrsb + a3_cdrsb + a4_cdrsb + a5_cdrsb ~ 1,
+                                          a1_mmse + a2_mmse + a3_mmse + a4_mmse + a5_mmse ~ 1,
+                                          s ~ PRE + MCI + DEM + Age_bl + 0,
+                                          k ~ Age_bl + 0),
+                             random = list(s ~ 1,
+                                           k ~ name + 0),
+                             groups = ~ RID,
+                             start = list(fixed = fixed_start_coef,
+                                          random = random_start
+                             ),
+                             weights = varIdent(form = ~ 1 | name),
+                             control = nlmeControl(msMaxIter = 100))
+
+# system("say spline model done")
+
+fixed.effects(mod_joint_cog_spline_AgeK)
+```
+
+
+Add predicted disease times
+```{r}
+
+AIC(mod_joint_cog,mod_joint_cog_spline,mod_joint_cog_spline_AgeK) 
+
+prog_dat$disease_time_cog <- with(prog_dat, Month_bl + 
+                                    fixed.effects(mod_joint_cog)['s.PRE'] * PRE +
+                                    fixed.effects(mod_joint_cog)['s.MCI'] * MCI +
+                                    fixed.effects(mod_joint_cog)['s.DEM'] * DEM +
+                                    fixed.effects(mod_joint_cog)['s.Age_bl'] * Age_bl +
+                                    random.effects(mod_joint_cog)[as.character(RID), 's.(Intercept)'])
+
+prog_dat$disease_time_cog_spline <- with(prog_dat, Month_bl + 
+                                           fixed.effects(mod_joint_cog_spline)['s.PRE'] * PRE +
+                                           fixed.effects(mod_joint_cog_spline)['s.MCI'] * MCI +
+                                           fixed.effects(mod_joint_cog_spline)['s.DEM'] * DEM +
+                                           fixed.effects(mod_joint_cog_spline)['s.Age_bl'] * Age_bl +
+                                           random.effects(mod_joint_cog_spline)[as.character(RID), 's.(Intercept)'])
+
+
+prog_dat$disease_time_cog_spline_AgeK <- with(prog_dat, Month_bl + 
+                                           fixed.effects(mod_joint_cog_spline_AgeK)['s.PRE'] * PRE +
+                                           fixed.effects(mod_joint_cog_spline_AgeK)['s.MCI'] * MCI +
+                                           fixed.effects(mod_joint_cog_spline_AgeK)['s.DEM'] * DEM +
+                                           fixed.effects(mod_joint_cog_spline_AgeK)['s.Age_bl'] * Age_bl +
+                                           random.effects(mod_joint_cog_spline_AgeK)[as.character(RID), 's.(Intercept)'])
+
+
+ggplot(prog_dat, aes(x = disease_time_cog, y = value, group = RID)) + 
+  geom_line() +
+  facet_wrap(~ name, scales = 'free_y')
+
+ggplot(prog_dat, aes(x = disease_time_cog_spline, y = value, group = RID)) + 
+  geom_line() +
+  facet_wrap(~ name, scales = 'free_y')
+
+ggplot(prog_dat, aes(x = disease_time_cog_spline_AgeK, y = value, group = RID)) + 
+  geom_line() +
+  facet_wrap(~ name, scales = 'free_y')
+```
+
+# Add Amyloid PET (centiloid)
+```{r}
+fixed_start_coef <- c(a1_adas = 20, a2_adas = 12, a3_adas = 12, a4_adas = 31, a5_adas = 78, 
+                      a1_cdrsb = 0, a2_cdrsb = 0.4, a3_cdrsb = 0.67, a4_cdrsb = 5.3, a5_cdrsb = 18, 
+                      a1_mmse = 34, a2_mmse = 29, a3_mmse = 28, a4_mmse = 22, a5_mmse = 4, 
+                      a1_AB_centiloid = 1, a2_AB_centiloid = 1.3, a3_AB_centiloid = 1.37, a4_AB_centiloid = 1.4, a5_AB_centiloid = 1.5, 
+                      s.PRE = 17, s.MCI = 63, s.DEM = 116, s.Age_bl = 0, k.Age_bl = 0)
+
+
+random_start <- random.effects(mod_joint_cog_spline)
+random_start[, 5] <- 0
+names(random_start)[5] <- c('k.nameAB_centiloid')
+
+
+mod_joint_AB_centiloid <- nlme(value ~ as.numeric(name == 'ADAS13') * spline_mean(Month_bl, s, a1_adas, a2_adas, a3_adas, a4_adas, a5_adas) +
+                    as.numeric(name == 'CDRSB') * spline_mean(Month_bl, s, a1_cdrsb, a2_cdrsb, a3_cdrsb, a4_cdrsb, a5_cdrsb) +
+                    as.numeric(name == 'MMSE') * spline_mean(Month_bl, s, a1_mmse, a2_mmse, a3_mmse, a4_mmse, a5_mmse) +
+                    as.numeric(name == 'AB_centiloid') * spline_mean(Month_bl, s, a1_AB_centiloid, a2_AB_centiloid, a3_AB_centiloid, a4_AB_centiloid, a5_AB_centiloid) + k,
+                  data = subset(prog_dat, name %in% c('ADAS13', 'CDRSB', 'MMSE','AB_centiloid')),
+                  fixed = list(a1_adas + a2_adas + a3_adas + a4_adas + a5_adas ~ 1,
+                               a1_cdrsb + a2_cdrsb + a3_cdrsb + a4_cdrsb + a5_cdrsb ~ 1,
+                               a1_mmse + a2_mmse + a3_mmse + a4_mmse + a5_mmse ~ 1,
+                               a1_AB_centiloid + a2_AB_centiloid + a3_AB_centiloid + a4_AB_centiloid + a5_AB_centiloid ~ 1,
+                               s ~ PRE + MCI + DEM + Age_bl + 0,
+                               k ~ Age_bl + 0),
+                  random = pdDiag(list(s ~ 1,
+                                       k ~ name + 0)),
+                  groups = ~ RID,
+                  start = list(fixed = fixed_start_coef,
+                               random = random_start),
+                  weights = varIdent(form = ~ 1 | name),
+                  control = nlmeControl(returnObject = TRUE,
+                                        msVerbose = TRUE))
+
+AIC(mod_joint_AB_centiloid) # 104187.7
+fixed.effects(mod_joint_AB_centiloid)
+
+system("say Amyloid PET added")
+```
+
+Update model
+```{r, eval=FALSE}
+fixed_start_coef <- fixed.effects(mod_joint_AB_centiloid)
+random_start <- random.effects(mod_joint_AB_centiloid)
+
+mod_joint_AB_centiloid_updated <- update(mod_joint_AB_centiloid,
+                    random = list(s ~ 1,
+                                  k ~ name + 0))
+
+# system("say model updated")
+
+orig_model_backup <- mod_joint_AB_centiloid
+mod_joint_AB_centiloid <- mod_joint_AB_centiloid_updated
+
+AIC(orig_model_backup, mod_joint_AB_centiloid_updated) # 103573.3
+```
+
+```{r, eval=FALSE}
+fixed_start_coef <- fixed.effects(mod_joint_AB_centiloid)
+random_start <- random.effects(mod_joint_AB_centiloid)
+
+mod_joint_AB_centiloid_updated_2 <- update(orig_model_backup,
+                    random = pdBlocked(list(s ~ 1,
+                                  k ~ name + 0)))
+
+system("say model updated")
+
+AIC(orig_model_backup, mod_joint_AB_centiloid_updated,mod_joint_AB_centiloid_updated_2)
+```
+
+Plot graphs: 
+```{r}
+prog_dat$disease_time_AB_centiloid <- with(prog_dat, Month_bl +
+                              fixed.effects(mod_joint_AB_centiloid)['s.PRE'] * PRE +
+                                fixed.effects(mod_joint_AB_centiloid)['s.MCI'] * MCI +
+                                fixed.effects(mod_joint_AB_centiloid)['s.DEM'] * DEM +
+                                fixed.effects(mod_joint_AB_centiloid)['s.Age_bl'] * Age_bl +
+                                random.effects(mod_joint_AB_centiloid)[as.character(RID), 's.(Intercept)'])
+
+ggplot(prog_dat, aes(x = disease_time_AB_centiloid, y= value, group = RID)) + 
+  geom_line() +
+  facet_wrap(~ name, scales = 'free_y')
+
+m <- 251
+mean_dat_AB_centiloid <- data.frame(Month_bl = seq(-100, 150, length = m),
+                       PRE = 0,
+                       MCI = 0,
+                       DEM = 0,
+                       Age_bl = 0,
+                       name = rep(levels(prog_dat$name), each = m))
+
+mean_dat_AB_centiloid$value <- predict(mod_joint_AB_centiloid, newdata = mean_dat_AB_centiloid, level = 0)
+
+ggplot(prog_dat, aes(x = disease_time_AB_centiloid, y = value, group = RID)) +
+  geom_line(alpha=0.3) +
+  geom_line(aes(x = Month_bl, y = value), data = mean_dat_AB_centiloid, inherit.aes = FALSE, color = 'red', size = 2) +
+  facet_wrap(~ name, scales = 'free_y')
+
+# align_at <- 0
+align_at <- min(mean_dat_AB_centiloid$Month_bl)
+
+mean_dat_AB_centiloid <- mean_dat_AB_centiloid %>%
+  group_by(name) %>%
+  # mutate(value_z = (value-value[Years_since_bl==align_at])/sd(value))
+  mutate(value_z = (value-value[Month_bl==align_at])/sd(value))
+
+mean_dat_AB_centiloid$value_z[mean_dat_AB_centiloid$name=='MMSE'] <- mean_dat_AB_centiloid$value_z[mean_dat_AB_centiloid$name=='MMSE']*-1
+
+ggplot(aes(x = Month_bl, y = value_z, group = name, color = name), data = mean_dat_AB_centiloid) +
+  # geom_line(aes(x = disease_time, y = value_z, group = RID)) +
+  geom_line(size = 2) 
+```
+
+
+Save workspace
+```{r, eval=FALSE}
+save.image(file="../data/Trajectory_models_covars.Rdata")
+
+save(prog_dat,
+     mod_joint_cog, mod_joint_cog_spline, mod_joint_AB_centiloid,
+     file="../data/Trajectory_models_essentials_covars.Rdata")
+```
+
+```{r, eval=FALSE}
+# load(file="../data/Trajectory_models_covars.Rdata")
+```
+
+# Save data for publication figures
+```{r, eval=FALSE}
+save(prog_dat, mod_joint_AB_centiloid, file = "../Publication figures/data/full_trajectory_models.Rdata")
+```
+

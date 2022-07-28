@@ -1,0 +1,304 @@
+---
+title: "Predict_trajectories_age"
+author: "Alfie Wearn"
+date: "04/05/2022"
+output: pdf_document
+---
+
+```{r}
+cascade_plot_age <- data.frame(disease_time = NA, age_dt0 = NA, type = NA, name = NA, value = NA, value_d_n = NA)
+
+for (v in vars) {
+  tmp <- subset(cascade_dat, name == v)
+  t_pp <- seq(quantile(tmp$disease_time, p = 0.05), quantile(tmp$disease_time, p = 0.95), length = 200) # Prediction range, excluding 5% limits of data
+  t_pp_age <- seq(quantile(tmp$age_dt0, p = 0.05), quantile(tmp$age_dt0, p = 0.95), length = 200) # Prediction range, excluding 5% limits of data
+  
+  mods <- list(age_only = array(NA, dim = c(6, 6)),
+               prog_only = array(NA, dim = c(6, 6)),
+               additive = array(NA, dim = c(6, 6)),
+               interaction = array(NA, dim = c(6, 6)),
+               null = array(NA, dim = c(6, 6)))
+  
+  # Do not use REML in loop since we are comparing the models using BIC
+  
+  # One does not have to do model selection here for different models w.
+  # interactions etc. 
+  # Would also be okay to just focus on the additive model and explore 
+  # the estimated age and disease progression contributions
+  
+  for (df1 in 1:6) {
+    for (df2 in 1:6) {
+      B <- ns(cascade_dat$disease_time, df = df1) 
+      B_age <- ns(cascade_dat$age_dt0, df = df2) 
+      # Could be done a bit more efficient since first two does not depend on DFs of the other
+      mods[[1]][df1 - 0, df2 - 0] <- BIC(lmer(value ~ predict(B_age, newx = age_dt0) + (1 | RID), 
+                                              data = tmp, REML = FALSE, control = lmerControl(optimizer = 'optimx',
+                                                                                              optCtrl  = list(method = 'L-BFGS-B'))))
+      mods[[2]][df1 - 0, df2 - 0]  <- BIC(lmer(value ~ predict(B, newx = disease_time) + (1 | RID), 
+                                               data = tmp, REML = FALSE, control = lmerControl(optimizer = 'optimx',
+                                                                                               optCtrl  = list(method = 'L-BFGS-B'))))
+      mods[[3]][df1 - 0, df2 - 0]  <- BIC(lmer(value ~ predict(B, newx = disease_time) + 
+                                                 predict(B_age, newx = age_dt0) + (1 | RID), 
+                                               data = tmp, REML = FALSE, control = lmerControl(optimizer = 'optimx',
+                                                                                               optCtrl  = list(method = 'L-BFGS-B'))))
+      mods[[4]][df1 - 0, df2 - 0]  <- BIC(lmer(value ~ predict(B, newx = disease_time) * 
+                                                 predict(B_age, newx = age_dt0) + (1 | RID), 
+                                               data = tmp, REML = FALSE, control = lmerControl(optimizer = 'optimx',
+                                                                                               optCtrl  = list(method = 'L-BFGS-B'))))
+      mods[[5]][df1 - 0, df2 - 0]  <- BIC(lmer(value ~ (1 | RID), 
+                                               data = tmp, REML = FALSE, control = lmerControl(optimizer = 'optimx',
+                                                                                               optCtrl  = list(method = 'L-BFGS-B'))))
+    }
+  }
+  
+  best <- which.min(lapply(mods, min))
+  dfs <- which(mods[[best]] == min(mods[[best]]), arr.ind = TRUE)
+  
+  df1 <- dfs[1] + 0 
+  df2 <- dfs[2] + 0
+  
+  cat(paste(v, nrow(tmp), ':', round(min(t_pp)), round(max(t_pp)), 'dfs = ', df1, df2, 'Best Model:',names(best) ,'\n'))
+  B <- ns(cascade_dat$disease_time, df = df1) 
+  B_age <- ns(cascade_dat$age_dt0, df = df2) 
+  f <- formula(c('value ~ predict(B_age, newx = age_dt0) + (1 | RID)',
+                 'value ~ predict(B, newx = disease_time) + (1 | RID)',
+                 'value ~ predict(B, newx = disease_time) + predict(B_age, newx = age_dt0) + (1 | RID)',
+                 'value ~ predict(B, newx = disease_time) * predict(B_age, newx = age_dt0) + (1 | RID)',
+                 'value ~ (1 | RID)')[best[1]])
+  
+  # Use REML here
+  mod <- lmer(f, 
+              data = tmp, REML = TRUE, control = lmerControl(optimizer = 'optimx',
+                                                             optCtrl  = list(method = 'L-BFGS-B')))
+  
+  direction <- -1
+  if (v %in% invert_vars)
+    direction <- 1
+  
+  
+  cascade_plot_age <- rbind(cascade_plot_age, 
+                        data.frame(
+                          disease_time = c(rep(0, length = length(t_pp_age)),
+                                           rep(t_pp, 6)), 
+                          age_dt0 = c(t_pp_age, rep(c(60, 65, 70, 75, 80, 85), each = length(t_pp))),
+                          type = rep(c('Age pattern at disease time 0',
+                                       paste('Disease time 0 at age', c(60, 65, 70, 75, 80, 85))), each = length(t_pp)),
+                          name = v, 
+                          value = predict(mod, 
+                                          re.form = ~ 0,
+                                          newdata = data.frame(disease_time = c(rep(0, length = length(t_pp_age)),
+                                                                                rep(t_pp, 6)), 
+                                                               age_dt0 = c(t_pp_age, rep(c(60, 65, 70, 75, 80, 85), each = length(t_pp))))),
+                          value_d_n = direction / summary(mod)$sigma * 
+                            (predict(mod, 
+                                     re.form = ~ 0,
+                                     newdata = data.frame(disease_time = c(rep(0, length = length(t_pp_age)),
+                                                                           rep(t_pp, 6)), 
+                                                          age_dt0 = c(t_pp_age, rep(c(60, 65, 70, 75, 80, 85), each = length(t_pp))))) -
+                               predict(mod, 
+                                       re.form = ~ 0,
+                                       newdata = data.frame(disease_time = c(rep(0, length = length(t_pp_age)),
+                                                                             rep(c(t_pp[1] -  diff(t_pp)[1], t_pp[1:(length(t_pp) - 1)]), 6)), 
+                                                            age_dt0 = c(t_pp_age, rep(c(60, 65, 70, 75, 80, 85), each = length(t_pp)))))) / diff(t_pp)[1]))
+}
+```
+
+```{r}
+save(cascade_plot_age, file = '../data/cascade_plot_age.Rdata')
+```
+
+
+```{r}
+cascade_plot_age <- na.omit(cascade_plot_age)
+cascade_plot_age$value_n <- cascade_plot_age$value
+
+for (v in vars) {
+  idx <- cascade_plot_age$name == v
+  if (v %in% invert_vars) {
+    cascade_plot_age$value_n[idx] <- with(cascade_plot_age[idx, ], (value - min(value)) / diff(range(value)))
+  } else {
+    cascade_plot_age$value_n[idx] <- 1 - with(cascade_plot_age[idx, ], (value - min(value)) / diff(range(value)))
+  }
+}
+```
+
+
+```{r}
+cascade_plot_age$value_n2 <- cascade_plot_age$value
+
+for (v in vars) {
+  idx <- cascade_plot_age$name == v
+  if (v %in% invert_vars) {
+    min_n <- quantile(subset(progmod_data, DX_baseline_Ab=='Healthy')[, v], p = 0.5, na.rm = TRUE)
+    max_n <- quantile(subset(progmod_data, DX_baseline_Ab=='Healthy')[, v], p = 0.95, na.rm = TRUE)
+
+    cascade_plot_age$value_n2[idx] <- with(cascade_plot_age[idx, ], (value - min_n) / (max_n - min_n))
+  } else {
+    min_n <- quantile(subset(progmod_data, DX_baseline_Ab=='Healthy')[, v], p = 0.05, na.rm = TRUE)
+    max_n <- quantile(subset(progmod_data, DX_baseline_Ab=='Healthy')[, v], p = 0.5, na.rm = TRUE)
+
+    cascade_plot_age$value_n2[idx] <- with(cascade_plot_age[idx, ], (value - max_n) / (min_n - max_n))
+  }
+}
+```
+
+```{r, eval=FALSE}
+ggplot(subset(plot_age_subset, type != 'Age pattern at disease time 0'), aes(x = age_dt0, y = value_n2, 
+                                                    color = name)) +
+  geom_line()
+```
+
+
+Plots for all
+```{r}
+plot_age_subset <- cascade_plot_age
+
+# Just exploring from disease time 0 and forward - one could also look prior to this
+ggplot(subset(plot_age_subset, type != 'Age pattern at disease time 0' & disease_time >= 0), aes(x = age_dt0 + disease_time / 12, y = value_n, 
+                                                                          group = interaction(name, type),
+                                                                          color = type)) +
+  scale_color_brewer(palette = 'RdYlGn', direction = -1) +
+  geom_line() +
+  geom_line(data = subset(plot_age_subset, type == 'Age pattern at disease time 0'), 
+            linetype = '11',
+            color = 'black') + # This is not in legend
+  facet_wrap(~ name)
+
+
+ggplot(subset(plot_age_subset, type != 'Age pattern at disease time 0' & disease_time >= 0), aes(x = age_dt0 + disease_time / 12, y = value_d_n, 
+                                                                          group = interaction(name, type),
+                                                                          color = type)) +
+  geom_line() +
+  geom_line(data = subset(plot_age_subset, type == 'Age pattern at disease time 0'), 
+            linetype = '11',
+            color = 'black') + # This is not in legend
+  facet_wrap(~ name)
+
+
+
+# Alfie additions
+ggplot(subset(plot_age_subset, type != 'Age pattern at disease time 0' & disease_time >= 0), aes(x = age_dt0 + disease_time / 12, y = value, 
+                                                                          group = interaction(name, type),
+                                                                          color = type)) +
+  geom_line() +
+  geom_line(data = subset(plot_age_subset, type == 'Age pattern at disease time 0'), 
+            linetype = '11',
+            color = 'black') + # This is not in legend
+  facet_wrap(~ name, scales = 'free')
+
+# Relative to Healthy group
+ggplot(subset(plot_age_subset, type != 'Age pattern at disease time 0' & disease_time >= 0), aes(x = age_dt0 + disease_time / 12, y = value_n2, 
+                                                                          group = interaction(name, type),
+                                                                          color = type)) +
+  geom_line() +
+  geom_line(data = subset(plot_age_subset, type == 'Age pattern at disease time 0'), 
+            linetype = '11',
+            color = 'black') + # This is not in legend
+  facet_wrap(~ name)
+
+```
+
+Plots for biomarkers
+```{r}
+plot_age_subset <- cascade_plot_age %>% subset(name %in% c('ABETA','AV1451','AV45','AB_centiloid','PTAU'))
+
+# Just exploring from disease time 0 and forward - one could also look prior to this
+ggplot(subset(plot_age_subset, type != 'Age pattern at disease time 0' & disease_time >= 0), aes(x = age_dt0 + disease_time / 12, y = value_n, 
+                                                                          group = interaction(name, type),
+                                                                          color = type)) +
+  scale_color_brewer(palette = 'RdYlGn', direction = -1) +
+  geom_line() +
+  geom_line(data = subset(plot_age_subset, type == 'Age pattern at disease time 0'), 
+            linetype = '11',
+            color = 'black') + # This is not in legend
+  facet_wrap(~ name)
+
+
+ggplot(subset(plot_age_subset, type != 'Age pattern at disease time 0' & disease_time >= 0), aes(x = age_dt0 + disease_time / 12, y = value_d_n, 
+                                                                          group = interaction(name, type),
+                                                                          color = type)) +
+  geom_line() +
+  geom_line(data = subset(plot_age_subset, type == 'Age pattern at disease time 0'), 
+            linetype = '11',
+            color = 'black') + # This is not in legend
+  facet_wrap(~ name)
+
+
+
+# Alfie additions
+ggplot(subset(plot_age_subset, type != 'Age pattern at disease time 0' & disease_time >= 0), aes(x = age_dt0 + disease_time / 12, y = value, 
+                                                                          group = interaction(name, type),
+                                                                          color = type)) +
+  geom_line() +
+  geom_line(data = subset(plot_age_subset, type == 'Age pattern at disease time 0'), 
+            linetype = '11',
+            color = 'black') + # This is not in legend
+  facet_wrap(~ name, scales = 'free')
+
+# Relative to Healthy group
+ggplot(subset(plot_age_subset, type != 'Age pattern at disease time 0' & disease_time >= 0), aes(x = age_dt0 + disease_time / 12, y = value_n2, 
+                                                                          group = interaction(name, type),
+                                                                          color = type)) +
+  geom_line() +
+  geom_line(data = subset(plot_age_subset, type == 'Age pattern at disease time 0'), 
+            linetype = '11',
+            color = 'black') + # This is not in legend
+  facet_wrap(~ name)
+
+```
+
+
+
+
+```{r}
+plot_age_subset <- cascade_plot_age %>% subset(name %in% c('all_Hipp_PC1','all_Hipp_PC2','all_Hipp_PC3','all_Hipp_PC4','all_Hipp_PC5','Volume_AvgHipp'))
+
+# Just exploring from disease time 0 and forward - one could also look prior to this
+ggplot(subset(plot_age_subset, type != 'Age pattern at disease time 0' & disease_time >= 0), aes(x = age_dt0 + disease_time / 12, y = value_n, 
+                                                                          group = interaction(name, type),
+                                                                          color = type)) +
+  geom_line() +
+  geom_line(data = subset(plot_age_subset, type == 'Age pattern at disease time 0'), 
+            linetype = '11',
+            color = 'black') + # This is not in legend
+  facet_wrap(~ name)
+
+
+ggplot(subset(plot_age_subset, type != 'Age pattern at disease time 0' & disease_time >= 0), aes(x = age_dt0 + disease_time / 12, y = value_d_n, 
+                                                                          group = interaction(name, type),
+                                                                          color = type)) +
+  geom_line() +
+  geom_line(data = subset(plot_age_subset, type == 'Age pattern at disease time 0'), 
+            linetype = '11',
+            color = 'black') + # This is not in legend
+  facet_wrap(~ name)
+
+
+
+# Alfie additions
+ggplot(subset(plot_age_subset, type != 'Age pattern at disease time 0' & disease_time >= 0), aes(x = age_dt0 + disease_time / 12, y = value, 
+                                                                          group = interaction(name, type),
+                                                                          color = type)) +
+  geom_line() +
+  geom_line(data = subset(plot_age_subset, type == 'Age pattern at disease time 0'), 
+            linetype = '11',
+            color = 'black') + # This is not in legend
+  facet_wrap(~ name, scales = 'free')
+
+# Relative to Healthy group
+ggplot(subset(plot_age_subset, type != 'Age pattern at disease time 0' & disease_time >= 0), aes(x = age_dt0 + disease_time / 12, y = value_n2, 
+                                                                          group = interaction(name, type),
+                                                                          color = type)) +
+  geom_line() +
+  geom_line(data = subset(plot_age_subset, type == 'Age pattern at disease time 0'), 
+            linetype = '11',
+            color = 'black') + # This is not in legend
+  facet_wrap(~ name)
+
+```
+
+# Save data for publication figures
+```{r, eval=FALSE}
+save(cascade_plot_age, file = "../Publication figures/data/predict_age_trajectories.Rdata")
+```
+
